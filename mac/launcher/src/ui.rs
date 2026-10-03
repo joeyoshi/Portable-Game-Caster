@@ -1,12 +1,11 @@
 use std::cell::{Cell, OnceCell, RefCell};
 use std::process::Child;
 use std::sync::{
-    mpsc::{self, Receiver, Sender},
+    mpsc::{self, Receiver},
     Arc,
     Mutex,
 };
 use std::thread;
-use std::time::Duration;
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
@@ -46,8 +45,7 @@ use objc2_foundation::{
     NSTimer,
 };
 
-use crate::discovery;
-use crate::player;
+use crate::worker;
 use crate::state::AppState;
 
 
@@ -573,7 +571,7 @@ impl AppDelegate {
 
 
         thread::spawn(move || {
-            run_stream_flow(
+            worker::run_stream_flow(
                 tx,
                 player_handle,
             );
@@ -766,314 +764,6 @@ impl AppDelegate {
                         spinner.stopAnimation(None);
                     }
                 }
-            }
-        }
-    }
-}
-
-
-// -----------------------------------------------------------------------------
-// Background discovery / playback flow
-// -----------------------------------------------------------------------------
-
-fn run_stream_flow(
-    tx: Sender<AppState>,
-    player_handle: Arc<Mutex<Option<Child>>>,
-) {
-    let send = |state: AppState| {
-        let _ = tx.send(state);
-    };
-
-
-    // -------------------------------------------------------------------------
-    // Discover PGC
-    // -------------------------------------------------------------------------
-
-    send(AppState::Discovering);
-
-    let endpoint =
-        match discovery::discover_stream() {
-            Ok(endpoint) => endpoint,
-
-            Err(error) => {
-                send(
-                    AppState::Error(
-                        error.to_string()
-                    )
-                );
-
-                return;
-            }
-        };
-
-
-    let host =
-        endpoint.host.clone();
-
-
-    // -------------------------------------------------------------------------
-    // Host resolved
-    // -------------------------------------------------------------------------
-
-    send(
-        AppState::Resolving(
-            host.clone()
-        )
-    );
-
-
-    // -------------------------------------------------------------------------
-    // Confirm MediaMTX is reachable
-    // -------------------------------------------------------------------------
-
-    send(
-        AppState::Connecting(
-            host.clone()
-        )
-    );
-
-
-    if let Err(error) =
-        player::check_stream_service(
-            &endpoint.address,
-            endpoint.port,
-        )
-    {
-        send(
-            AppState::Error(
-                error.to_string()
-            )
-        );
-
-        return;
-    }
-
-
-    // -------------------------------------------------------------------------
-    // Launch ffplay
-    // -------------------------------------------------------------------------
-
-    send(
-        AppState::WaitingForStream(
-            host.clone()
-        )
-    );
-
-
-    let child =
-        match player::launch_ffplay(
-            &endpoint.url()
-        ) {
-            Ok(child) => child,
-
-            Err(error) => {
-                send(
-                    AppState::Error(
-                        error.to_string()
-                    )
-                );
-
-                return;
-            }
-        };
-
-
-    // Store ffplay where the AppKit thread can terminate it.
-    {
-        let mut slot =
-            player_handle
-                .lock()
-                .expect(
-                    "player process lock poisoned"
-                );
-
-        *slot = Some(child);
-    }
-
-
-    // -------------------------------------------------------------------------
-    // Temporary stream readiness test
-    //
-    // For now:
-    //
-    // MediaMTX reachable
-    // +
-    // ffplay survives one second
-    //
-    // Later this will be replaced by real host/capture health data.
-    // -------------------------------------------------------------------------
-
-    thread::sleep(
-        Duration::from_secs(1)
-    );
-
-
-    {
-        let mut slot =
-            player_handle
-                .lock()
-                .expect(
-                    "player process lock poisoned"
-                );
-
-
-        let Some(child) =
-            slot.as_mut()
-        else {
-            // Player was terminated externally.
-            return;
-        };
-
-
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                *slot = None;
-
-                send(
-                    AppState::Error(
-                        format!(
-                            "Player exited before the stream started ({status})."
-                        )
-                    )
-                );
-
-                return;
-            }
-
-
-            Ok(None) => {}
-
-
-            Err(error) => {
-                *slot = None;
-
-                send(
-                    AppState::Error(
-                        format!(
-                            "Could not monitor player: {error}"
-                        )
-                    )
-                );
-
-                return;
-            }
-        }
-    }
-
-
-    // -------------------------------------------------------------------------
-    // Playback is considered active
-    // -------------------------------------------------------------------------
-
-    send(
-        AppState::Playing(
-            host
-        )
-    );
-
-
-    // -------------------------------------------------------------------------
-    // Monitor ffplay until it closes
-    // -------------------------------------------------------------------------
-
-    loop {
-        thread::sleep(
-            Duration::from_millis(250)
-        );
-
-
-        let result = {
-            let mut slot =
-                player_handle
-                    .lock()
-                    .expect(
-                        "player process lock poisoned"
-                    );
-
-
-            let Some(child) =
-                slot.as_mut()
-            else {
-                // Player was terminated by the UI.
-                return;
-            };
-
-
-            child.try_wait()
-        };
-
-
-        match result {
-            // -----------------------------------------------------------------
-            // ffplay exited
-            // -----------------------------------------------------------------
-
-            Ok(Some(status)) => {
-                {
-                    let mut slot =
-                        player_handle
-                            .lock()
-                            .expect(
-                                "player process lock poisoned"
-                            );
-
-                    *slot = None;
-                }
-
-
-                if status.success() {
-                    send(
-                        AppState::Idle
-                    );
-                } else {
-                    send(
-                        AppState::Error(
-                            format!(
-                                "Player exited with status {status}."
-                            )
-                        )
-                    );
-                }
-
-
-                return;
-            }
-
-
-            // -----------------------------------------------------------------
-            // ffplay still running
-            // -----------------------------------------------------------------
-
-            Ok(None) => {}
-
-
-            // -----------------------------------------------------------------
-            // Monitoring error
-            // -----------------------------------------------------------------
-
-            Err(error) => {
-                {
-                    let mut slot =
-                        player_handle
-                            .lock()
-                            .expect(
-                                "player process lock poisoned"
-                            );
-
-                    *slot = None;
-                }
-
-
-                send(
-                    AppState::Error(
-                        format!(
-                            "Player error: {error}"
-                        )
-                    )
-                );
-
-
-                return;
             }
         }
     }

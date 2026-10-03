@@ -1,11 +1,27 @@
 #[derive(Debug, Clone)]
 pub enum AppState {
     Idle,
+
     Discovering,
+
     Resolving(String),
+
     Connecting(String),
+
     WaitingForStream(String),
+
     Playing(String),
+
+    ReconnectingStream {
+        host: String,
+        seconds_remaining: u8,
+    },
+
+    ReconnectingHost {
+        host: String,
+        seconds_remaining: u8,
+    },
+
     Error(String),
 }
 
@@ -22,26 +38,36 @@ impl AppState {
             }
 
             AppState::Resolving(host) => {
-                format!(
-                    "Found {host}"
-                )
+                format!("Found {host}")
             }
 
             AppState::Connecting(host) => {
-                format!(
-                    "Connecting to {host}…"
-                )
+                format!("Connecting to {host}…")
             }
 
             AppState::WaitingForStream(host) => {
-                format!(
-                    "Waiting for stream from {host}…"
-                )
+                format!("Waiting for stream from {host}…")
             }
 
             AppState::Playing(host) => {
+                format!("Connected to {host}")
+            }
+
+            AppState::ReconnectingStream {
+                host,
+                seconds_remaining,
+            } => {
                 format!(
-                    "Connected to {host}"
+                    "Connection to stream on {host} lost. Reconnecting… {seconds_remaining}"
+                )
+            }
+
+            AppState::ReconnectingHost {
+                host,
+                seconds_remaining,
+            } => {
+                format!(
+                    "Connection to {host} lost. Reconnecting… {seconds_remaining}"
                 )
             }
 
@@ -51,6 +77,7 @@ impl AppState {
         }
     }
 
+
     pub fn is_busy(&self) -> bool {
         matches!(
             self,
@@ -59,6 +86,8 @@ impl AppState {
                 | AppState::Resolving(_)
                 | AppState::Connecting(_)
                 | AppState::WaitingForStream(_)
+                | AppState::ReconnectingStream { .. }
+                | AppState::ReconnectingHost { .. }
         )
     }
 }
