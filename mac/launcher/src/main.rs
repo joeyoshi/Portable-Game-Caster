@@ -66,6 +66,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("  URL:  {}", url);
                 println!();
                 println!("Launching stream...");
+                println!();
 
                 mdns.stop_browse(SERVICE_TYPE)?;
                 mdns.shutdown()?;
@@ -127,19 +128,49 @@ fn launch_ffplay(url: &str) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn find_ffplay() -> Result<String, Box<dyn std::error::Error>> {
-    let output = Command::new("brew")
-        .args(["--prefix", "ffmpeg-full"])
-        .output()?;
+    use std::env;
+    use std::path::Path;
+    use std::process::Command;
 
-    if !output.status.success() {
-        return Err(
-            "Could not locate ffmpeg-full through Homebrew.".into()
-        );
+    // Allow an explicit override later.
+    if let Ok(path) = env::var("PGC_FFPLAY_PATH") {
+        if Path::new(&path).exists() {
+            return Ok(path);
+        }
     }
 
-    let prefix = String::from_utf8(output.stdout)?
-        .trim()
-        .to_string();
+    let home = env::var("HOME").unwrap_or_default();
 
-    Ok(format!("{}/bin/ffplay", prefix))
+    let brew_candidates = [
+        format!("{}/homebrew/bin/brew", home),
+        "/opt/homebrew/bin/brew".to_string(),
+        "/usr/local/bin/brew".to_string(),
+    ];
+
+    for brew in brew_candidates {
+        if !Path::new(&brew).exists() {
+            continue;
+        }
+
+        let output = Command::new(&brew)
+            .args(["--prefix", "ffmpeg-full"])
+            .output()?;
+
+        if output.status.success() {
+            let prefix = String::from_utf8(output.stdout)?
+                .trim()
+                .to_string();
+
+            let ffplay = format!("{}/bin/ffplay", prefix);
+
+            if Path::new(&ffplay).exists() {
+                return Ok(ffplay);
+            }
+        }
+    }
+
+    Err(
+        "Could not locate ffplay. Install ffmpeg-full with Homebrew or set PGC_FFPLAY_PATH."
+            .into(),
+    )
 }
