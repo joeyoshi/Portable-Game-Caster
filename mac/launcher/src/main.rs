@@ -91,9 +91,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn launch_ffplay(url: &str) -> Result<(), Box<dyn std::error::Error>> {
     let ffplay_path = find_ffplay()?;
 
-    let status = Command::new("caffeinate")
-        .arg("-i")
-        .arg(ffplay_path)
+    println!("ffplay: {}", ffplay_path);
+    println!("Connecting to: {}", url);
+    println!();
+
+    let status = Command::new(&ffplay_path)
         .args([
             "-rtsp_transport",
             "tcp",
