@@ -23,14 +23,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .txt_properties
                     .iter()
                     .find(|property| property.key() == "protocol")
-                    .and_then(|property| property.val_str())
+                    .map(|property| property.val_str())
                     .unwrap_or(EXPECTED_PROTOCOL);
 
                 let path = service
                     .txt_properties
                     .iter()
                     .find(|property| property.key() == "path")
-                    .and_then(|property| property.val_str())
+                    .map(|property| property.val_str())
                     .unwrap_or("/gameplay");
 
                 if protocol != EXPECTED_PROTOCOL {
