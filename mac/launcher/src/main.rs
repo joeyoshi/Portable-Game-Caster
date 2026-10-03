@@ -43,10 +43,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let port = service.port;
 
-                let address = service
-                    .addresses
+                let ipv4_addresses = service.get_addresses_v4();
+
+                let address = ipv4_addresses
                     .iter()
-                    .find(|addr| addr.is_ipv4())
+                    .next()
                     .ok_or("Portable Game Caster was found, but no IPv4 address was resolved.")?;
 
                 let url = format!(
