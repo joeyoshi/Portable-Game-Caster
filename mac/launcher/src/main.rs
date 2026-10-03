@@ -20,7 +20,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         Err(error) => {
             ui::set_state(&AppState::Error(error.to_string()));
-            return Err(error);
+            return Ok(());
         }
     };
 
@@ -40,7 +40,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         Err(error) => {
             ui::set_state(&AppState::Error(error.to_string()));
-            return Err(error);
+            return Ok(());
         }
     };
 
