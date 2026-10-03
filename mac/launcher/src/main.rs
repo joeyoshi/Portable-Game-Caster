@@ -41,19 +41,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
 
-                let host = service.host.trim_end_matches('.');
                 let port = service.port;
+
+                let address = service
+                    .addresses
+                    .iter()
+                    .find(|addr| addr.is_ipv4())
+                    .ok_or("Portable Game Caster was found, but no IPv4 address was resolved.")?;
 
                 let url = format!(
                     "{}://{}:{}{}",
                     protocol,
-                    host,
+                    address,
                     port,
                     path
                 );
 
                 println!("Found Portable Game Caster:");
-                println!("  Host: {}", host);
+                println!("  Host: {}", service.host.trim_end_matches('.'));
+                println!("  Address: {}", address);
                 println!("  Port: {}", port);
                 println!("  Path: {}", path);
                 println!("  URL:  {}", url);
