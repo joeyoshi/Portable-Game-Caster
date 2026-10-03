@@ -14,16 +14,16 @@ impl AppState {
         match self {
             AppState::Idle => "Ready".into(),
             AppState::Discovering => {
-                "Searching for Portable Game Caster…".into()
+                "Searching for Portable Game Caster...".into()
             }
             AppState::Resolving => {
-                "Resolving host…".into()
+                "Resolving host...".into()
             }
             AppState::Connecting => {
-                "Connecting to host…".into()
+                "Connecting to streaming service...".into()
             }
             AppState::WaitingForStream => {
-                "Waiting for stream…".into()
+                "Waiting for stream...".into()
             }
             AppState::Playing => {
                 "Stream connected!".into()

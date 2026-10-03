@@ -35,32 +35,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     ui::set_state(&AppState::Connecting);
 
-    let mut player = match player::launch_ffplay(&endpoint.url()) {
-        Ok(player) => player,
-
-        Err(error) => {
+        if let Err(error) =
+            player::check_stream_service(&endpoint.address, endpoint.port)
+        {
             ui::set_state(&AppState::Error(error.to_string()));
             return Ok(());
         }
-    };
 
-    ui::set_state(&AppState::WaitingForStream);
+        ui::set_state(&AppState::WaitingForStream);
 
-    // Temporary placeholder until we can determine stream readiness properly.
-    thread::sleep(Duration::from_secs(1));
+        let mut player = match player::launch_ffplay(&endpoint.url()) {
+            Ok(player) => player,
 
-    ui::set_state(&AppState::Playing);
+            Err(error) => {
+                ui::set_state(&AppState::Error(error.to_string()));
+                return Ok(());
+            }
+        };
 
-    let status = player.wait()?;
+        // Temporary placeholder.
+        // Eventually this will be replaced by real playback/host health detection.
+        thread::sleep(Duration::from_secs(1));
 
-    if !status.success() {
-        ui::set_state(&AppState::Error(format!(
-            "ffplay exited with status: {}",
-            status
-        )));
-    } else {
-        ui::set_state(&AppState::Idle);
-    }
+        ui::set_state(&AppState::Playing);
+
+        let status = player.wait()?;
+
+        if !status.success() {
+            ui::set_state(&AppState::Error(format!(
+                "ffplay exited with status: {}",
+                status
+            )));
+        } else {
+            ui::set_state(&AppState::Idle);
+        }
 
     Ok(())
 }
