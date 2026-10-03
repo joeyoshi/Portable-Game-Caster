@@ -90,7 +90,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "pgc-discovery"
+name = "pgc-discovery-windows"
 version = "0.1.0"
 dependencies = [
  "mdns-sd",
