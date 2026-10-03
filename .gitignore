@@ -29,6 +29,7 @@ target/
 
 # macOS
 .DS_Store
+*.app
 
 # Windows
 *.exe
