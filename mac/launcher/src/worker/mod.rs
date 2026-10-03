@@ -18,6 +18,7 @@ pub type SharedPlayer =
     Arc<Mutex<Option<Child>>>;
 
 
+
 // -----------------------------------------------------------------------------
 // Player monitoring result
 // -----------------------------------------------------------------------------
@@ -44,8 +45,7 @@ pub fn run_stream_flow(
     player_handle: SharedPlayer,
 ) {
     let send = |state: AppState| {
-        let _ =
-            tx.send(state);
+        let _ = tx.send(state);
     };
 
 
@@ -147,18 +147,10 @@ pub fn run_stream_flow(
 
     // -------------------------------------------------------------------------
     // Temporary readiness test
-    //
-    // This is still our current approximation:
-    //
-    // MediaMTX reachable
-    // +
-    // ffplay survives startup
-    //
-    // Eventually host status will replace this.
     // -------------------------------------------------------------------------
 
     thread::sleep(
-        Duration::from_secs(1)
+        Duration::from_millis(250)
     );
 
 
@@ -186,6 +178,17 @@ pub fn run_stream_flow(
 
     // -------------------------------------------------------------------------
     // Active playback monitor
+    //
+    // IMPORTANT:
+    //
+    // ffplay does not necessarily exit when its RTSP connection dies.
+    // It can remain alive indefinitely while printing EOF / connection-reset
+    // messages.
+    //
+    // Because of that, we monitor BOTH:
+    //
+    // 1. the ffplay child process
+    // 2. the MediaMTX RTSP TCP service
     // -------------------------------------------------------------------------
 
     loop {
@@ -194,20 +197,24 @@ pub fn run_stream_flow(
         );
 
 
+        // ---------------------------------------------------------------------
+        // First check whether ffplay itself exited.
+        // ---------------------------------------------------------------------
+
         match poll_player(
             &player_handle
         ) {
             // -------------------------------------------------------------
-            // Everything is healthy.
+            // Still running.
+            //
+            // Continue below and independently verify RTSP health.
             // -------------------------------------------------------------
 
             PlayerPoll::Running => {}
 
 
             // -------------------------------------------------------------
-            // ffplay was closed normally by the user.
-            //
-            // Return to Idle and expose Search for Host.
+            // User closed ffplay normally.
             // -------------------------------------------------------------
 
             PlayerPoll::ExitedSuccessfully => {
@@ -226,9 +233,7 @@ pub fn run_stream_flow(
 
 
             // -------------------------------------------------------------
-            // Playback died unexpectedly.
-            //
-            // Enter reconnect logic.
+            // ffplay itself crashed.
             // -------------------------------------------------------------
 
             PlayerPoll::ExitedUnexpectedly
@@ -238,33 +243,25 @@ pub fn run_stream_flow(
                 );
 
 
-                match reconnect::attempt_reconnect(
+                if reconnect_after_loss(
                     &send,
                     &mut endpoint,
                     &player_handle,
                 ) {
-                    reconnect::ReconnectResult::Recovered => {
-                        // Successfully relaunched playback.
-                        //
-                        // Return to the normal player-monitor loop.
-                    }
-
-
-                    reconnect::ReconnectResult::Failed => {
-                        send(
-                            AppState::Idle
-                        );
-
-
-                        return;
-                    }
+                    continue;
                 }
+
+
+                send(
+                    AppState::Idle
+                );
+
+
+                return;
             }
 
 
             // -------------------------------------------------------------
-            // No child exists.
-            //
             // Usually means AppKit deliberately killed ffplay during Quit.
             // -------------------------------------------------------------
 
@@ -274,6 +271,35 @@ pub fn run_stream_flow(
         }
     }
 }
+
+
+// -----------------------------------------------------------------------------
+// Run the reconnect subsystem after playback/service loss
+// -----------------------------------------------------------------------------
+
+fn reconnect_after_loss<F>(
+    send: &F,
+    endpoint: &mut discovery::StreamEndpoint,
+    player_handle: &SharedPlayer,
+) -> bool
+where
+    F: Fn(AppState),
+{
+    match reconnect::attempt_reconnect(
+        send,
+        endpoint,
+        player_handle,
+    ) {
+        reconnect::ReconnectResult::Recovered => {
+            true
+        }
+
+        reconnect::ReconnectResult::Failed => {
+            false
+        }
+    }
+}
+
 
 
 // -----------------------------------------------------------------------------
