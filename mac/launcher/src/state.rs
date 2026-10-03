@@ -2,35 +2,63 @@
 pub enum AppState {
     Idle,
     Discovering,
-    Resolving,
-    Connecting,
-    WaitingForStream,
-    Playing,
+    Resolving(String),
+    Connecting(String),
+    WaitingForStream(String),
+    Playing(String),
     Error(String),
 }
+
 
 impl AppState {
     pub fn message(&self) -> String {
         match self {
-            AppState::Idle => "Ready".into(),
+            AppState::Idle => {
+                "Ready".into()
+            }
+
             AppState::Discovering => {
-                "Searching for Portable Game Caster...".into()
+                "Searching for Portable Game Caster…".into()
             }
-            AppState::Resolving => {
-                "Resolving host...".into()
+
+            AppState::Resolving(host) => {
+                format!(
+                    "Found {host}"
+                )
             }
-            AppState::Connecting => {
-                "Connecting to streaming service...".into()
+
+            AppState::Connecting(host) => {
+                format!(
+                    "Connecting to {host}…"
+                )
             }
-            AppState::WaitingForStream => {
-                "Waiting for stream...".into()
+
+            AppState::WaitingForStream(host) => {
+                format!(
+                    "Waiting for stream from {host}…"
+                )
             }
-            AppState::Playing => {
-                "Stream connected!".into()
+
+            AppState::Playing(host) => {
+                format!(
+                    "Connected to {host}"
+                )
             }
+
             AppState::Error(message) => {
-                format!("Error: {message}")
+                message.clone()
             }
         }
+    }
+
+    pub fn is_busy(&self) -> bool {
+        matches!(
+            self,
+
+            AppState::Discovering
+                | AppState::Resolving(_)
+                | AppState::Connecting(_)
+                | AppState::WaitingForStream(_)
+        )
     }
 }
