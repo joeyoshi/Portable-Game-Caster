@@ -60,7 +60,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 println!("Found Portable Game Caster:");
                 println!("  Host: {}", service.host.trim_end_matches('.'));
-                println!("  Address: {}", address);
+                println!("  All addresses: {:?}", service.addresses);
+                println!("  IPv4 addresses: {:?}", service.get_addresses_v4());
                 println!("  Port: {}", port);
                 println!("  Path: {}", path);
                 println!("  URL:  {}", url);
