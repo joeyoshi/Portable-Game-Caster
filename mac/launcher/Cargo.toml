@@ -1,0 +1,9 @@
+[package]
+name = "pgc-launcher-macos"
+version = "0.1.0"
+edition = "2024"
+description = "macOS discovery and playback launcher for Portable Game Caster"
+license = "GPL-3.0-only"
+
+[dependencies]
+mdns-sd = "0.21.4"
