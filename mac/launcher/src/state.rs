@@ -26,7 +26,7 @@ impl AppState {
                 "Waiting for stream…".into()
             }
             AppState::Playing => {
-                "Stream connected".into()
+                "Stream connected!".into()
             }
             AppState::Error(message) => {
                 format!("Error: {message}")
