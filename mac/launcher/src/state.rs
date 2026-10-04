@@ -2,7 +2,9 @@
 pub enum AppState {
     Idle,
 
-    Discovering,
+    Discovering {
+        seconds_remaining: Option<u8>,
+    },
 
     Resolving(String),
 
@@ -32,63 +34,64 @@ pub enum AppState {
 impl AppState {
     pub fn message(&self) -> String {
         match self {
-            AppState::Idle => {
-                "Ready".into()
-            }
-
-            AppState::Discovering => {
-                "Searching for Portable Game Caster…".into()
-            }
-
-            AppState::Resolving(host) => {
-                format!("Found {host}")
-            }
-
-            AppState::Connecting(host) => {
-                format!("Connecting to {host}…")
-            }
-
+            AppState::Idle => "Ready".into(),
+            AppState::Discovering { .. } => "Searching for a Portable Game Caster host…".into(),
+            AppState::Resolving(_) => "Host found.".into(),
+            AppState::Connecting(_) => "Connecting to streaming service…".into(),
             AppState::WaitingForStream {
-                host,
                 fallback_seconds_remaining: None,
-            } => {
-                format!("Waiting for stream from {host}…")
-            }
+                ..
+            } => "Waiting for stream.".into(),
+            AppState::WaitingForStream {
+                fallback_seconds_remaining: Some(_),
+                ..
+            } => "Stream is taking longer than expected.".into(),
+            AppState::Playing(_) => "Connected.".into(),
+            AppState::ReconnectingStream { .. } => "Connection to stream lost.".into(),
+            AppState::ReconnectingHost { .. } => "Connection to host lost.".into(),
+            AppState::Error(message) => message.clone(),
+        }
+    }
+
+
+    pub fn detail_message(&self) -> Option<String> {
+        match self {
+            AppState::Discovering {
+                seconds_remaining: Some(seconds_remaining),
+            } => Some(format!("Searching… {seconds_remaining}")),
 
             AppState::WaitingForStream {
-                host: _,
                 fallback_seconds_remaining: Some(seconds_remaining),
-            } => {
-                format!(
-                    "Stream startup is taking longer than expected… {seconds_remaining}s"
-                )
-            }
-
-            AppState::Playing(host) => {
-                format!("Connected to {host}")
-            }
+                ..
+            } => Some(format!("Waiting for stream… {seconds_remaining}")),
 
             AppState::ReconnectingStream {
-                host,
                 seconds_remaining,
-            } => {
-                format!(
-                    "Connection to stream on {host} lost. Reconnecting… {seconds_remaining}"
-                )
+                ..
             }
-
-            AppState::ReconnectingHost {
-                host,
+            | AppState::ReconnectingHost {
                 seconds_remaining,
-            } => {
-                format!(
-                    "Connection to {host} lost. Reconnecting… {seconds_remaining}"
-                )
-            }
+                ..
+            } => Some(format!("Reconnecting… {seconds_remaining}")),
 
-            AppState::Error(message) => {
-                message.clone()
-            }
+            _ => None,
+        }
+    }
+
+
+    pub fn host(&self) -> Option<&str> {
+        match self {
+            AppState::Resolving(host)
+            | AppState::Connecting(host)
+            | AppState::Playing(host) => Some(host),
+
+            AppState::WaitingForStream { host, .. }
+            | AppState::ReconnectingStream { host, .. }
+            | AppState::ReconnectingHost { host, .. } => Some(host),
+
+            AppState::Idle
+            | AppState::Discovering { .. }
+            | AppState::Error(_) => None,
         }
     }
 
@@ -97,7 +100,7 @@ impl AppState {
         matches!(
             self,
 
-            AppState::Discovering
+            AppState::Discovering { .. }
                 | AppState::Resolving(_)
                 | AppState::Connecting(_)
                 | AppState::WaitingForStream { .. }

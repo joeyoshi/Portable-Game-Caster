@@ -1,6 +1,10 @@
 use std::cell::{Cell, OnceCell, RefCell};
 use std::process::Child;
 use std::sync::{
+    atomic::{
+        AtomicBool,
+        Ordering,
+    },
     mpsc::{self, Receiver},
     Arc,
     Mutex,
@@ -55,6 +59,7 @@ use crate::state::AppState;
 
 struct AppDelegateIvars {
     window: OnceCell<Retained<NSWindow>>,
+    host_label: OnceCell<Retained<NSTextField>>,
     status_label: OnceCell<Retained<NSTextField>>,
     detail_label: OnceCell<Retained<NSTextField>>,
     spinner: OnceCell<Retained<NSProgressIndicator>>,
@@ -64,12 +69,22 @@ struct AppDelegateIvars {
 
     receiver: RefCell<Option<Receiver<AppState>>>,
     worker_running: Cell<bool>,
+    cancellation: RefCell<Option<worker::CancellationToken>>,
+    primary_action: Cell<PrimaryAction>,
 
     // Shared ownership of the active ffplay child process.
     //
     // The worker thread launches and monitors it.
     // The AppKit thread can terminate it when the user quits PGC.
     player: Arc<Mutex<Option<Child>>>,
+}
+
+
+#[derive(Clone, Copy)]
+enum PrimaryAction {
+    Retry,
+    Cancel,
+    Stop,
 }
 
 
@@ -158,6 +173,20 @@ define_class!(
         }
 
 
+        #[unsafe(method(primaryAction:))]
+        fn primary_action(
+            &self,
+            _sender: &AnyObject,
+        ) {
+            match self.ivars().primary_action.get() {
+                PrimaryAction::Retry => self.start_worker(),
+                PrimaryAction::Cancel | PrimaryAction::Stop => {
+                    self.cancel_active_session();
+                }
+            }
+        }
+
+
         // ---------------------------------------------------------------------
         // Search again after playback has ended normally
         // ---------------------------------------------------------------------
@@ -206,6 +235,7 @@ impl AppDelegate {
         let this =
             Self::alloc(mtm).set_ivars(AppDelegateIvars {
                 window: OnceCell::new(),
+                host_label: OnceCell::new(),
                 status_label: OnceCell::new(),
                 detail_label: OnceCell::new(),
                 spinner: OnceCell::new(),
@@ -215,6 +245,8 @@ impl AppDelegate {
 
                 receiver: RefCell::new(None),
                 worker_running: Cell::new(false),
+                cancellation: RefCell::new(None),
+                primary_action: Cell::new(PrimaryAction::Retry),
 
                 player: Arc::new(
                     Mutex::new(None)
@@ -310,6 +342,32 @@ impl AppDelegate {
 
 
         // ---------------------------------------------------------------------
+        // Resolved host identity
+        // ---------------------------------------------------------------------
+
+        let host_label =
+            NSTextField::labelWithString(
+                ns_string!(""),
+                mtm,
+            );
+
+        host_label.setFrame(
+            NSRect::new(
+                NSPoint::new(20.0, 151.0),
+                NSSize::new(420.0, 20.0),
+            )
+        );
+
+        host_label.setAlignment(
+            NSTextAlignment::Center
+        );
+
+        host_label.setHidden(true);
+
+        content.addSubview(&host_label);
+
+
+        // ---------------------------------------------------------------------
         // Primary status
         // ---------------------------------------------------------------------
 
@@ -321,7 +379,7 @@ impl AppDelegate {
 
         status_label.setFrame(
             NSRect::new(
-                NSPoint::new(20.0, 130.0),
+                NSPoint::new(20.0, 122.0),
                 NSSize::new(420.0, 26.0),
             )
         );
@@ -345,8 +403,8 @@ impl AppDelegate {
 
         detail_label.setFrame(
             NSRect::new(
-                NSPoint::new(30.0, 82.0),
-                NSSize::new(400.0, 42.0),
+                NSPoint::new(30.0, 86.0),
+                NSSize::new(400.0, 30.0),
             )
         );
 
@@ -392,15 +450,15 @@ impl AppDelegate {
             NSButton::buttonWithTitle_target_action(
                 ns_string!("Retry"),
                 Some(self),
-                Some(sel!(retry:)),
+                Some(sel!(primaryAction:)),
                 mtm,
             )
         };
 
         retry_button.setFrame(
             NSRect::new(
-                NSPoint::new(140.0, 15.0),
-                NSSize::new(80.0, 32.0),
+                NSPoint::new(115.0, 15.0),
+                NSSize::new(120.0, 32.0),
             )
         );
 
@@ -468,6 +526,13 @@ impl AppDelegate {
             .set(window.clone())
             .expect(
                 "window should only be initialized once"
+            );
+
+        self.ivars()
+            .host_label
+            .set(host_label)
+            .expect(
+                "host label should only be initialized once"
             );
 
         self.ivars()
@@ -552,7 +617,9 @@ impl AppDelegate {
             .set(true);
 
         self.render_state(
-            &AppState::Discovering
+            &AppState::Discovering {
+                seconds_remaining: None,
+            }
         );
 
 
@@ -570,12 +637,65 @@ impl AppDelegate {
             );
 
 
+        let cancellation =
+            Arc::new(
+                AtomicBool::new(false)
+            );
+
+
+        *self.ivars()
+            .cancellation
+            .borrow_mut() =
+            Some(
+                Arc::clone(&cancellation)
+            );
+
+
         thread::spawn(move || {
             worker::run_stream_flow(
                 tx,
                 player_handle,
+                cancellation,
             );
         });
+    }
+
+
+    // -------------------------------------------------------------------------
+    // Cancel discovery, connection, recovery, or playback by user request.
+    // -------------------------------------------------------------------------
+
+    fn cancel_active_session(&self) {
+        if let Some(cancellation) = self
+            .ivars()
+            .cancellation
+            .borrow()
+            .as_ref()
+        {
+            cancellation.store(
+                true,
+                Ordering::Relaxed,
+            );
+        }
+
+
+        self.terminate_player();
+
+
+        // Dropping the receiver invalidates every pending state from the
+        // cancelled worker before a later search starts a fresh session.
+        self.ivars()
+            .receiver
+            .borrow_mut()
+            .take();
+
+
+        self.ivars()
+            .worker_running
+            .set(false);
+
+
+        self.render_state(&AppState::Idle);
     }
 
 
@@ -611,6 +731,14 @@ impl AppDelegate {
         &self,
         state: &AppState,
     ) {
+        let host_label = self
+            .ivars()
+            .host_label
+            .get()
+            .expect(
+                "host label should exist"
+            );
+
         let status_label = self
             .ivars()
             .status_label
@@ -652,6 +780,26 @@ impl AppDelegate {
             );
 
 
+        if let Some(host) = state.host() {
+            host_label.setStringValue(
+                &NSString::from_str(
+                    &friendly_host_name(host)
+                )
+            );
+
+            host_label.setHidden(false);
+        } else if matches!(
+            state,
+            AppState::Idle | AppState::Discovering { .. }
+        ) {
+            host_label.setStringValue(
+                ns_string!("")
+            );
+
+            host_label.setHidden(true);
+        }
+
+
         match state {
             // -----------------------------------------------------------------
             // Error
@@ -672,6 +820,14 @@ impl AppDelegate {
 
                 retry_button.setHidden(false);
                 search_button.setHidden(true);
+
+                retry_button.setTitle(
+                    ns_string!("Retry")
+                );
+
+                self.ivars()
+                    .primary_action
+                    .set(PrimaryAction::Retry);
 
                 self.ivars()
                     .worker_running
@@ -710,13 +866,9 @@ impl AppDelegate {
             // Playing
             // -----------------------------------------------------------------
 
-            AppState::Playing(host) => {
+            AppState::Playing(_) => {
                 status_label.setStringValue(
-                    &NSString::from_str(
-                        &format!(
-                            "Connected to {host}"
-                        )
-                    )
+                    &NSString::from_str(&state.message())
                 );
 
                 detail_label.setStringValue(
@@ -729,8 +881,16 @@ impl AppDelegate {
                     spinner.stopAnimation(None);
                 }
 
-                retry_button.setHidden(true);
+                retry_button.setTitle(
+                    ns_string!("Stop Stream")
+                );
+
+                retry_button.setHidden(false);
                 search_button.setHidden(true);
+
+                self.ivars()
+                    .primary_action
+                    .set(PrimaryAction::Stop);
             }
 
 
@@ -749,11 +909,21 @@ impl AppDelegate {
                 );
 
                 detail_label.setStringValue(
-                    ns_string!("")
+                    &NSString::from_str(
+                        &state.detail_message().unwrap_or_default()
+                    )
                 );
 
-                retry_button.setHidden(true);
+                retry_button.setTitle(
+                    ns_string!("Cancel")
+                );
+
+                retry_button.setHidden(false);
                 search_button.setHidden(true);
+
+                self.ivars()
+                    .primary_action
+                    .set(PrimaryAction::Cancel);
 
                 if state.is_busy() {
                     unsafe {
@@ -766,6 +936,37 @@ impl AppDelegate {
                 }
             }
         }
+    }
+}
+
+
+// -----------------------------------------------------------------------------
+// Presentation-only mDNS hostname cleanup
+// -----------------------------------------------------------------------------
+
+fn friendly_host_name(
+    host: &str,
+) -> String {
+    let trimmed =
+        host.trim_end_matches('.');
+
+
+    let without_local =
+        trimmed
+            .strip_suffix(".local")
+            .unwrap_or(trimmed);
+
+
+    let without_pgc =
+        without_local
+            .strip_suffix("-pgc")
+            .unwrap_or(without_local);
+
+
+    if without_pgc.is_empty() {
+        trimmed.to_string()
+    } else {
+        without_pgc.to_ascii_uppercase()
     }
 }
 

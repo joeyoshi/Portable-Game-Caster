@@ -2,6 +2,10 @@ mod reconnect;
 
 use std::process::Child;
 use std::sync::{
+    atomic::{
+        AtomicBool,
+        Ordering,
+    },
     mpsc::{
         Sender,
         TryRecvError,
@@ -23,6 +27,10 @@ use crate::state::AppState;
 
 pub type SharedPlayer =
     Arc<Mutex<Option<Child>>>;
+
+
+pub type CancellationToken =
+    Arc<AtomicBool>;
 
 
 // -----------------------------------------------------------------------------
@@ -86,6 +94,8 @@ enum MediaWarmupResult {
 
     TimedOut,
 
+    Cancelled,
+
     UserClosed,
 
     Missing,
@@ -99,12 +109,16 @@ enum MediaWarmupResult {
 pub fn run_stream_flow(
     tx: Sender<AppState>,
     player_handle: SharedPlayer,
+    cancellation: CancellationToken,
 ) {
     let send =
         |state: AppState| {
-            logging::state(
-                &state
-            );
+            if cancellation.load(Ordering::Relaxed) {
+                return;
+            }
+
+
+            logging::state(&state);
 
 
             let _ =
@@ -120,19 +134,34 @@ pub fn run_stream_flow(
     // This path never emits Reconnecting states.
     // -------------------------------------------------------------------------
 
-    send(
-        AppState::Discovering
-    );
+    send(AppState::Discovering {
+        seconds_remaining: None,
+    });
+
+
+    let mut emit_search_countdown =
+        |seconds_remaining| {
+            send(AppState::Discovering {
+                seconds_remaining: Some(seconds_remaining),
+            });
+        };
 
 
     let mut endpoint =
-        match discovery::discover_stream() {
+        match discovery::discover_stream(
+            &cancellation,
+            &mut emit_search_countdown,
+        ) {
             Ok(endpoint) => {
                 endpoint
             }
 
 
             Err(error) => {
+                if cancellation.load(Ordering::Relaxed) {
+                    return;
+                }
+
                 send(
                     AppState::Error(
                         error.to_string()
@@ -143,6 +172,11 @@ pub fn run_stream_flow(
                 return;
             }
         };
+
+
+    if cancellation.load(Ordering::Relaxed) {
+        return;
+    }
 
 
     let host =
@@ -179,6 +213,10 @@ pub fn run_stream_flow(
             endpoint.port,
         )
     {
+        if cancellation.load(Ordering::Relaxed) {
+            return;
+        }
+
         send(
             AppState::Error(
                 error.to_string()
@@ -215,6 +253,7 @@ pub fn run_stream_flow(
             &endpoint,
             &player_handle,
             MEDIA_WARMUP_TIMEOUT,
+            &cancellation,
         ) {
             MediaWarmupResult::Started {
                 receiver,
@@ -237,6 +276,11 @@ pub fn run_stream_flow(
                 );
 
 
+                return;
+            }
+
+
+            MediaWarmupResult::Cancelled => {
                 return;
             }
 
@@ -288,6 +332,10 @@ pub fn run_stream_flow(
     // -------------------------------------------------------------------------
 
     loop {
+        if cancellation.load(Ordering::Relaxed) {
+            return;
+        }
+
         thread::sleep(
             Duration::from_millis(
                 100
@@ -320,6 +368,7 @@ pub fn run_stream_flow(
                     &send,
                     &mut endpoint,
                     &player_handle,
+                    &cancellation,
                 ) {
                     Some(
                         new_receiver
@@ -412,6 +461,7 @@ pub fn run_stream_flow(
                     &send,
                     &mut endpoint,
                     &player_handle,
+                    &cancellation,
                 ) {
                     Some(
                         new_receiver
@@ -450,6 +500,7 @@ fn recover_stream<F>(
     send: &F,
     endpoint: &mut discovery::StreamEndpoint,
     player_handle: &SharedPlayer,
+    cancellation: &AtomicBool,
 ) -> Option<
     player::TransportReceiver
 >
@@ -461,6 +512,10 @@ where
 
 
     loop {
+        if cancellation.load(Ordering::Relaxed) {
+            return None;
+        }
+
         // ---------------------------------------------------------------------
         // Stage 1:
         //
@@ -481,6 +536,7 @@ where
         match reconnect::restore_handshake(
             send,
             endpoint,
+            cancellation,
         ) {
             reconnect::ReconnectResult::HandshakeRestored => {}
 
@@ -499,6 +555,11 @@ where
                 );
 
 
+                return None;
+            }
+
+
+            reconnect::ReconnectResult::Cancelled => {
                 return None;
             }
         }
@@ -534,6 +595,7 @@ where
             endpoint,
             player_handle,
             MEDIA_WARMUP_TIMEOUT,
+            cancellation,
         ) {
             MediaWarmupResult::Started {
                 receiver,
@@ -598,6 +660,11 @@ where
             }
 
 
+            MediaWarmupResult::Cancelled => {
+                return None;
+            }
+
+
             MediaWarmupResult::UserClosed => {
                 send(
                     AppState::Idle
@@ -632,6 +699,7 @@ fn wait_for_media_with_retries<F>(
     endpoint: &discovery::StreamEndpoint,
     player_handle: &SharedPlayer,
     timeout: Duration,
+    cancellation: &AtomicBool,
 ) -> MediaWarmupResult
 where
     F: Fn(AppState),
@@ -681,6 +749,11 @@ where
     while Instant::now()
         < deadline
     {
+        if cancellation.load(Ordering::Relaxed) {
+            terminate_player(player_handle);
+            return MediaWarmupResult::Cancelled;
+        }
+
         update_media_warmup_state(
             send,
             &endpoint.host,
@@ -719,6 +792,7 @@ where
             match launch_player(
                 endpoint,
                 player_handle,
+                cancellation,
             ) {
                 Ok(receiver) => {
                     receiver
@@ -756,6 +830,11 @@ where
         // ---------------------------------------------------------------------
 
         loop {
+            if cancellation.load(Ordering::Relaxed) {
+                terminate_player(player_handle);
+                return MediaWarmupResult::Cancelled;
+            }
+
             update_media_warmup_state(
                 send,
                 &endpoint.host,
@@ -1048,12 +1127,13 @@ fn log_media_warmup_timeout(
 fn launch_player(
     endpoint: &discovery::StreamEndpoint,
     player_handle: &SharedPlayer,
+    cancellation: &AtomicBool,
 ) -> Result<
     player::TransportReceiver,
     String,
 > {
     let (
-        child,
+        mut child,
         transport_rx,
     ) =
         player::launch_ffplay(
@@ -1064,6 +1144,18 @@ fn launch_player(
                 error.to_string()
             }
         )?;
+
+
+    if cancellation.load(Ordering::Relaxed) {
+        let _ = child.kill();
+        let _ = child.wait();
+
+
+        return Err(
+            "Session was cancelled before ffplay could start."
+                .to_string()
+        );
+    }
 
 
     let mut slot =

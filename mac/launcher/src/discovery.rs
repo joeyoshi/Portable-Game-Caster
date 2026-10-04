@@ -6,6 +6,10 @@ use std::time::{
     Duration,
     Instant,
 };
+use std::sync::atomic::{
+    AtomicBool,
+    Ordering,
+};
 
 use crate::logging;
 
@@ -64,6 +68,8 @@ impl StreamEndpoint {
 // -----------------------------------------------------------------------------
 
 pub fn discover_stream(
+    cancelled: &AtomicBool,
+    on_countdown: &mut dyn FnMut(u8),
 ) -> Result<
     StreamEndpoint,
     Box<dyn std::error::Error>,
@@ -79,8 +85,10 @@ pub fn discover_stream(
     match discover_matching(
         None,
         Duration::from_secs(
-            DISCOVERY_TIMEOUT_SECS
+            DISCOVERY_TIMEOUT_SECS,
         ),
+        cancelled,
+        Some(on_countdown),
     )? {
         Some(endpoint) => {
             Ok(endpoint)
@@ -117,6 +125,7 @@ pub fn discover_stream(
 pub fn discover_host(
     expected_host: &str,
     timeout: Duration,
+    cancelled: &AtomicBool,
 ) -> Result<
     Option<StreamEndpoint>,
     Box<dyn std::error::Error>,
@@ -132,6 +141,8 @@ pub fn discover_host(
     discover_matching(
         Some(expected_host),
         timeout,
+        cancelled,
+        None,
     )
 }
 
@@ -143,6 +154,8 @@ pub fn discover_host(
 fn discover_matching(
     expected_host: Option<&str>,
     timeout: Duration,
+    cancelled: &AtomicBool,
+    mut on_countdown: Option<&mut dyn FnMut(u8)>,
 ) -> Result<
     Option<StreamEndpoint>,
     Box<dyn std::error::Error>,
@@ -173,9 +186,45 @@ fn discover_matching(
         false;
 
 
+    let countdown_start =
+        timeout / 2;
+
+
+    let mut last_countdown:
+        Option<u8> =
+            None;
+
+
     while started.elapsed()
         < timeout
     {
+        if cancelled.load(Ordering::Relaxed) {
+            break;
+        }
+
+
+        if started.elapsed() >= countdown_start {
+            let milliseconds =
+                timeout
+                    .saturating_sub(started.elapsed())
+                    .as_millis();
+
+
+            let seconds_remaining =
+                ((milliseconds + 999) / 1000) as u8;
+
+
+            if last_countdown != Some(seconds_remaining) {
+                last_countdown = Some(seconds_remaining);
+
+
+                if let Some(callback) = on_countdown.as_mut() {
+                    callback(seconds_remaining);
+                }
+            }
+        }
+
+
         match receiver.recv_timeout(
             Duration::from_millis(250)
         ) {

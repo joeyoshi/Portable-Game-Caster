@@ -1,4 +1,8 @@
 use std::thread;
+use std::sync::atomic::{
+    AtomicBool,
+    Ordering,
+};
 use std::time::{
     Duration,
     Instant,
@@ -32,6 +36,8 @@ pub enum ReconnectResult {
     HandshakeRestored,
 
     Failed,
+
+    Cancelled,
 }
 
 
@@ -54,6 +60,7 @@ pub enum ReconnectResult {
 pub fn restore_handshake<F>(
     send: &F,
     endpoint: &mut discovery::StreamEndpoint,
+    cancelled: &AtomicBool,
 ) -> ReconnectResult
 where
     F: Fn(AppState),
@@ -86,6 +93,10 @@ where
     while Instant::now()
         < deadline
     {
+        if cancelled.load(Ordering::Relaxed) {
+            return ReconnectResult::Cancelled;
+        }
+
         let seconds =
             seconds_remaining(
                 deadline
@@ -128,6 +139,7 @@ where
             Duration::from_millis(
                 300
             ),
+            cancelled,
         ) {
             Ok(
                 Some(
