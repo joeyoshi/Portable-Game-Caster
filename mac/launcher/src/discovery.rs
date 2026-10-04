@@ -1,12 +1,40 @@
-use mdns_sd::{ServiceDaemon, ServiceEvent};
-use std::time::{Duration, Instant};
+use mdns_sd::{
+    ServiceDaemon,
+    ServiceEvent,
+};
+use std::time::{
+    Duration,
+    Instant,
+};
 
-const SERVICE_TYPE: &str = "_pgc._tcp.local.";
-const EXPECTED_PROTOCOL: &str = "rtsp";
-const DISCOVERY_TIMEOUT_SECS: u64 = 10;
+use crate::logging;
 
 
-#[derive(Debug, Clone)]
+// -----------------------------------------------------------------------------
+// PGC discovery protocol
+// -----------------------------------------------------------------------------
+
+const SERVICE_TYPE: &str =
+    "_pgc._tcp.local.";
+
+const EXPECTED_PROTOCOL: &str =
+    "rtsp";
+
+const DEFAULT_STREAM_PATH: &str =
+    "/gameplay";
+
+const DISCOVERY_TIMEOUT_SECS: u64 =
+    10;
+
+
+// -----------------------------------------------------------------------------
+// Resolved stream endpoint
+// -----------------------------------------------------------------------------
+
+#[derive(
+    Debug,
+    Clone,
+)]
 pub struct StreamEndpoint {
     pub host: String,
     pub address: String,
@@ -31,10 +59,23 @@ impl StreamEndpoint {
 
 // -----------------------------------------------------------------------------
 // Standard discovery
+//
+// Finds any available Portable Game Caster host.
 // -----------------------------------------------------------------------------
 
 pub fn discover_stream(
-) -> Result<StreamEndpoint, Box<dyn std::error::Error>> {
+) -> Result<
+    StreamEndpoint,
+    Box<dyn std::error::Error>,
+> {
+    logging::debug(
+        "DISCOVERY",
+        format_args!(
+            "Starting PGC host discovery"
+        ),
+    );
+
+
     match discover_matching(
         None,
         Duration::from_secs(
@@ -45,7 +86,16 @@ pub fn discover_stream(
             Ok(endpoint)
         }
 
+
         None => {
+            logging::debug(
+                "DISCOVERY",
+                format_args!(
+                    "No PGC host discovered before timeout"
+                ),
+            );
+
+
             Err(
                 "No Portable Game Caster host was found on the local network."
                     .into()
@@ -56,15 +106,29 @@ pub fn discover_stream(
 
 
 // -----------------------------------------------------------------------------
-// Reconnect discovery
+// Targeted rediscovery
 //
-// Searches only for the host we were previously connected to.
+// Used during reconnect.
+//
+// Searches only for the exact host we were previously connected to so that
+// reconnecting can never silently switch to a different PGC machine.
 // -----------------------------------------------------------------------------
 
 pub fn discover_host(
     expected_host: &str,
     timeout: Duration,
-) -> Result<Option<StreamEndpoint>, Box<dyn std::error::Error>> {
+) -> Result<
+    Option<StreamEndpoint>,
+    Box<dyn std::error::Error>,
+> {
+    logging::trace(
+        "DISCOVERY",
+        format_args!(
+            "Searching specifically for host {expected_host}"
+        ),
+    );
+
+
     discover_matching(
         Some(expected_host),
         timeout,
@@ -79,9 +143,20 @@ pub fn discover_host(
 fn discover_matching(
     expected_host: Option<&str>,
     timeout: Duration,
-) -> Result<Option<StreamEndpoint>, Box<dyn std::error::Error>> {
+) -> Result<
+    Option<StreamEndpoint>,
+    Box<dyn std::error::Error>,
+> {
     let mdns =
         ServiceDaemon::new()?;
+
+
+    logging::trace(
+        "DISCOVERY",
+        format_args!(
+            "Starting mDNS browse for {SERVICE_TYPE}"
+        ),
+    );
 
 
     let receiver =
@@ -90,7 +165,7 @@ fn discover_matching(
         )?;
 
 
-    let start =
+    let started =
         Instant::now();
 
 
@@ -98,26 +173,39 @@ fn discover_matching(
         false;
 
 
-    while start.elapsed() < timeout {
+    while started.elapsed()
+        < timeout
+    {
         match receiver.recv_timeout(
             Duration::from_millis(250)
         ) {
             // -----------------------------------------------------------------
-            // We know a service exists, but don't have its full data yet.
+            // A PGC service was announced.
+            //
+            // At this point we don't necessarily have its hostname/IP yet.
             // -----------------------------------------------------------------
 
             Ok(
                 ServiceEvent::ServiceFound(
-                    _,
-                    _,
+                    _service_type,
+                    fullname,
                 )
             ) => {
-                service_found = true;
+                service_found =
+                    true;
+
+
+                logging::trace(
+                    "DISCOVERY",
+                    format_args!(
+                        "mDNS service found: {fullname}"
+                    ),
+                );
             }
 
 
             // -----------------------------------------------------------------
-            // Fully resolved PGC service
+            // Full service resolution
             // -----------------------------------------------------------------
 
             Ok(
@@ -125,7 +213,8 @@ fn discover_matching(
                     service
                 )
             ) => {
-                service_found = true;
+                service_found =
+                    true;
 
 
                 let resolved_host =
@@ -135,8 +224,18 @@ fn discover_matching(
                         .to_string();
 
 
-                // During reconnect we only accept the host we were already
-                // connected to.
+                logging::trace(
+                    "DISCOVERY",
+                    format_args!(
+                        "Resolved mDNS candidate host: {resolved_host}"
+                    ),
+                );
+
+
+                // -------------------------------------------------------------
+                // Targeted reconnect must stay on the SAME host.
+                // -------------------------------------------------------------
+
                 if let Some(expected) =
                     expected_host
                 {
@@ -150,10 +249,22 @@ fn discover_matching(
                             expected
                         )
                     {
+                        logging::trace(
+                            "DISCOVERY",
+                            format_args!(
+                                "Ignoring host {resolved_host}; expected {expected}"
+                            ),
+                        );
+
+
                         continue;
                     }
                 }
 
+
+                // -------------------------------------------------------------
+                // Validate protocol
+                // -------------------------------------------------------------
 
                 let protocol =
                     service
@@ -165,10 +276,26 @@ fn discover_matching(
                         );
 
 
-                if protocol != EXPECTED_PROTOCOL {
+                if !protocol
+                    .eq_ignore_ascii_case(
+                        EXPECTED_PROTOCOL
+                    )
+                {
+                    logging::trace(
+                        "DISCOVERY",
+                        format_args!(
+                            "Ignoring {resolved_host}; unsupported protocol {protocol}"
+                        ),
+                    );
+
+
                     continue;
                 }
 
+
+                // -------------------------------------------------------------
+                // Stream path
+                // -------------------------------------------------------------
 
                 let path =
                     service
@@ -176,9 +303,17 @@ fn discover_matching(
                             "path"
                         )
                         .unwrap_or(
-                            "/gameplay"
+                            DEFAULT_STREAM_PATH
                         );
 
+
+                // -------------------------------------------------------------
+                // IPv4 resolution
+                //
+                // mDNS can emit ServiceResolved before the IPv4 address record
+                // has reached us. This is a known transient case, so do not
+                // fail immediately.
+                // -------------------------------------------------------------
 
                 let addresses =
                     service
@@ -190,11 +325,21 @@ fn discover_matching(
                         .iter()
                         .next()
                 else {
-                    // mDNS can resolve the service before its IPv4 record
-                    // arrives. Keep listening rather than immediately failing.
+                    logging::trace(
+                        "DISCOVERY",
+                        format_args!(
+                            "Host {resolved_host} resolved without IPv4 address; continuing to listen"
+                        ),
+                    );
+
+
                     continue;
                 };
 
+
+                // -------------------------------------------------------------
+                // Build endpoint
+                // -------------------------------------------------------------
 
                 let endpoint =
                     StreamEndpoint {
@@ -215,6 +360,76 @@ fn discover_matching(
                     };
 
 
+                // -------------------------------------------------------------
+                // Human-readable diagnostic output
+                // -------------------------------------------------------------
+
+                logging::debug(
+                    "DISCOVERY",
+                    format_args!(
+                        "Resolved Portable Game Caster host"
+                    ),
+                );
+
+
+                logging::debug(
+                    "DISCOVERY",
+                    format_args!(
+                        "Hostname: {}",
+                        endpoint.host
+                    ),
+                );
+
+
+                logging::debug(
+                    "DISCOVERY",
+                    format_args!(
+                        "Address: {}",
+                        endpoint.address
+                    ),
+                );
+
+
+                logging::debug(
+                    "DISCOVERY",
+                    format_args!(
+                        "Protocol: {}",
+                        endpoint.protocol
+                    ),
+                );
+
+
+                logging::debug(
+                    "DISCOVERY",
+                    format_args!(
+                        "Port: {}",
+                        endpoint.port
+                    ),
+                );
+
+
+                logging::debug(
+                    "DISCOVERY",
+                    format_args!(
+                        "Path: {}",
+                        endpoint.path
+                    ),
+                );
+
+
+                logging::debug(
+                    "DISCOVERY",
+                    format_args!(
+                        "URL: {}",
+                        endpoint.url()
+                    ),
+                );
+
+
+                // -------------------------------------------------------------
+                // Clean up browser before returning.
+                // -------------------------------------------------------------
+
                 let _ =
                     mdns.stop_browse(
                         SERVICE_TYPE
@@ -231,15 +446,34 @@ fn discover_matching(
             }
 
 
-            // Ignore other mDNS events.
-            Ok(_) => {}
+            // -----------------------------------------------------------------
+            // Other mDNS lifecycle events aren't currently needed.
+            // -----------------------------------------------------------------
+
+            Ok(event) => {
+                logging::trace(
+                    "DISCOVERY",
+                    format_args!(
+                        "Ignoring mDNS event: {event:?}"
+                    ),
+                );
+            }
 
 
-            // recv_timeout simply means nothing arrived during this slice.
+            // -----------------------------------------------------------------
+            // recv_timeout only means nothing arrived during this polling slice.
+            //
+            // Keep listening until our overall deadline expires.
+            // -----------------------------------------------------------------
+
             Err(_) => {}
         }
     }
 
+
+    // -------------------------------------------------------------------------
+    // Discovery timed out
+    // -------------------------------------------------------------------------
 
     let _ =
         mdns.stop_browse(
@@ -251,21 +485,39 @@ fn discover_matching(
         mdns.shutdown();
 
 
-    // Initial discovery preserves the useful distinction we already had:
+    // -------------------------------------------------------------------------
+    // Initial discovery gets a more descriptive resolution error.
     //
-    // "nothing exists"
-    //
-    // versus
-    //
-    // "a service appeared but its address never resolved."
-    //
-    // Reconnect discovery simply reports None so the retry loop can continue.
+    // During targeted reconnect, None is preferable because reconnect.rs owns
+    // the retry/deadline behavior.
+    // -------------------------------------------------------------------------
+
     if expected_host.is_none()
         && service_found
     {
+        logging::debug(
+            "DISCOVERY",
+            format_args!(
+                "PGC service was seen, but its network address did not resolve before timeout"
+            ),
+        );
+
+
         return Err(
             "Portable Game Caster was found, but its network address could not be resolved."
                 .into()
+        );
+    }
+
+
+    if let Some(expected) =
+        expected_host
+    {
+        logging::trace(
+            "DISCOVERY",
+            format_args!(
+                "Host {expected} was not rediscovered before timeout"
+            ),
         );
     }
 

@@ -22,13 +22,16 @@ use std::sync::mpsc::{
 use std::thread;
 use std::time::Duration;
 
+use crate::logging;
+
 
 // -----------------------------------------------------------------------------
-// Transport events reported by the ffplay stderr monitor
+// Events derived from ffplay
 // -----------------------------------------------------------------------------
 
 #[derive(Debug)]
 pub enum TransportEvent {
+    MediaStarted,
     Lost,
 }
 
@@ -38,12 +41,25 @@ pub type TransportReceiver =
 
 
 // -----------------------------------------------------------------------------
-// Check whether the advertised RTSP service is reachable
+// Stream service checks
 // -----------------------------------------------------------------------------
 
 pub fn check_stream_service(
     address: &str,
     port: u16,
+) -> Result<(), Box<dyn Error>> {
+    check_stream_service_timeout(
+        address,
+        port,
+        Duration::from_secs(2),
+    )
+}
+
+
+pub fn check_stream_service_timeout(
+    address: &str,
+    port: u16,
+    timeout: Duration,
 ) -> Result<(), Box<dyn Error>> {
     let socket_address =
         format!(
@@ -52,9 +68,17 @@ pub fn check_stream_service(
         .parse::<SocketAddr>()?;
 
 
+    logging::trace(
+        "PLAYER",
+        format_args!(
+            "Probing RTSP service at {socket_address} with timeout {timeout:?}"
+        ),
+    );
+
+
     TcpStream::connect_timeout(
         &socket_address,
-        Duration::from_secs(2),
+        timeout,
     )
     .map_err(|_| {
         format!(
@@ -69,11 +93,6 @@ pub fn check_stream_service(
 
 // -----------------------------------------------------------------------------
 // Launch ffplay
-//
-// stderr is piped through PGC so we can:
-// - preserve ffplay's raw terminal diagnostics
-// - preserve carriage-return live stats
-// - detect RTSP transport loss
 // -----------------------------------------------------------------------------
 
 pub fn launch_ffplay(
@@ -86,10 +105,28 @@ pub fn launch_ffplay(
         find_ffplay()?;
 
 
-    let mut child =
-        Command::new(ffplay)
+    logging::debug(
+        "PLAYER",
+        format_args!(
+            "ffplay: {}",
+            ffplay.display()
+        ),
+    );
 
-            // Force FFmpeg/ffplay colour output even though stderr is piped.
+
+    logging::debug(
+        "PLAYER",
+        format_args!(
+            "Opening stream: {url}"
+        ),
+    );
+
+
+    let mut child =
+        Command::new(&ffplay)
+
+            // ffplay believes stderr is a pipe, so explicitly retain its
+            // normal colorized diagnostics for --verbose passthrough.
             .env(
                 "AV_LOG_FORCE_COLOR",
                 "1",
@@ -139,6 +176,15 @@ pub fn launch_ffplay(
             .spawn()?;
 
 
+    logging::debug(
+        "PLAYER",
+        format_args!(
+            "ffplay launched with PID {}",
+            child.id()
+        ),
+    );
+
+
     let mut ffplay_stderr =
         child
             .stderr
@@ -156,22 +202,26 @@ pub fn launch_ffplay(
 
 
     thread::spawn(move || {
-        const FAILURE_TEXT: &[u8] =
-            b"Failed reading RTSP data";
+        const FAILURE_TEXT: &str =
+            "Failed reading RTSP data";
 
 
-        let mut output =
+        let mut stderr =
             std::io::stderr();
 
 
-        let mut buffer =
+        let mut read_buffer =
             [0_u8; 4096];
 
 
-        // Keeps just enough bytes between reads to detect a failure string
-        // split across two OS read operations.
-        let mut scan_buffer:
-            Vec<u8> = Vec::new();
+        // Accumulates just enough textual data to split ffplay's combination
+        // of newline and carriage-return output into logical updates.
+        let mut parse_buffer =
+            Vec::<u8>::new();
+
+
+        let mut media_reported =
+            false;
 
 
         let mut loss_reported =
@@ -181,15 +231,15 @@ pub fn launch_ffplay(
         loop {
             let bytes_read =
                 match ffplay_stderr.read(
-                    &mut buffer
+                    &mut read_buffer
                 ) {
                     Ok(0) => {
                         break;
                     }
 
 
-                    Ok(bytes_read) => {
-                        bytes_read
+                    Ok(count) => {
+                        count
                     }
 
 
@@ -201,104 +251,208 @@ pub fn launch_ffplay(
                     }
 
 
-                    Err(_) => {
+                    Err(error) => {
+                        logging::trace(
+                            "PLAYER",
+                            format_args!(
+                                "ffplay stderr monitor ended: {error}"
+                            ),
+                        );
+
                         break;
                     }
                 };
 
 
             let chunk =
-                &buffer[..bytes_read];
+                &read_buffer[..bytes_read];
 
 
             // -------------------------------------------------------------
-            // Preserve ffplay's output exactly as emitted.
+            // --verbose gets ffplay's output byte-for-byte.
             //
-            // This retains:
-            // - ANSI colour codes
-            // - carriage returns
-            // - live stats updates
-            // - native spacing/formatting
+            // Normal and --debug modes still inspect it internally but don't
+            // pay the terminal-rendering cost.
             // -------------------------------------------------------------
 
-            let _ =
-                output.write_all(
-                    chunk
-                );
+            if logging::trace_enabled() {
+                let _ =
+                    stderr.write_all(
+                        chunk
+                    );
 
-
-            let _ =
-                output.flush();
-
-
-            // -------------------------------------------------------------
-            // Transport monitoring
-            //
-            // A single explicit RTSP read failure is enough to know that the
-            // active RTSP session has been lost.
-            // -------------------------------------------------------------
-
-            if loss_reported {
-                continue;
+                let _ =
+                    stderr.flush();
             }
 
 
-            scan_buffer.extend_from_slice(
+            // -------------------------------------------------------------
+            // Parse logical ffplay updates.
+            //
+            // ffplay's live statistics use '\r', while regular diagnostics
+            // use '\n'.
+            // -------------------------------------------------------------
+
+            parse_buffer.extend_from_slice(
                 chunk
             );
 
 
-            let failure_found =
-                scan_buffer
-                    .windows(
-                        FAILURE_TEXT.len()
-                    )
-                    .any(
-                        |window| {
-                            window
-                                == FAILURE_TEXT
+            while let Some(separator_index) =
+                parse_buffer
+                    .iter()
+                    .position(
+                        |byte| {
+                            *byte == b'\n'
+                                || *byte == b'\r'
                         }
+                    )
+            {
+                let segment =
+                    parse_buffer
+                        .drain(
+                            ..separator_index
+                        )
+                        .collect::<Vec<_>>();
+
+
+                // Remove the separator itself.
+                if !parse_buffer.is_empty() {
+                    parse_buffer.remove(0);
+                }
+
+
+                if segment.is_empty() {
+                    continue;
+                }
+
+
+                let text =
+                    String::from_utf8_lossy(
+                        &segment
                     );
 
 
-            if failure_found {
-                let _ =
-                    transport_tx.send(
-                        TransportEvent::Lost
+                // ---------------------------------------------------------
+                // RTSP transport failure
+                // ---------------------------------------------------------
+
+                if !loss_reported
+                    && text.contains(
+                        FAILURE_TEXT
+                    )
+                {
+                    logging::debug(
+                        "HEALTH",
+                        format_args!(
+                            "RTSP transport failure reported by ffplay"
+                        ),
                     );
 
 
-                loss_reported =
-                    true;
+                    let _ =
+                        transport_tx.send(
+                            TransportEvent::Lost
+                        );
 
 
-                scan_buffer.clear();
+                    loss_reported =
+                        true;
+                }
 
-                continue;
+
+                // ---------------------------------------------------------
+                // Actual media-flow confirmation
+                //
+                // ffplay emits live A/V synchronization statistics only once
+                // decoded playback is running. During stalled startup these
+                // commonly remain NaN.
+                //
+                // This is intentionally an interim signal until PGC has its
+                // proper media-health protocol.
+                // ---------------------------------------------------------
+
+                if !media_reported {
+                    let has_av_stats =
+                        text.contains(
+                            "M-V:"
+                        )
+                            || text.contains(
+                                "A-V:"
+                            );
+
+
+                    let has_queue_stats =
+                        text.contains(
+                            "vq="
+                        )
+                            || text.contains(
+                                "aq="
+                            );
+
+
+                    let is_nan =
+                        text
+                            .to_ascii_lowercase()
+                            .contains(
+                                "nan"
+                            );
+
+
+                    if has_av_stats
+                        && has_queue_stats
+                        && !is_nan
+                    {
+                        logging::debug(
+                            "HEALTH",
+                            format_args!(
+                                "Confirmed decoded media flow from ffplay"
+                            ),
+                        );
+
+
+                        let _ =
+                            transport_tx.send(
+                                TransportEvent::MediaStarted
+                            );
+
+
+                        media_reported =
+                            true;
+                    }
+                }
             }
 
 
-            // Keep only enough trailing data to detect FAILURE_TEXT if it
-            // happens to be divided between two reads.
-            let keep =
-                FAILURE_TEXT
-                    .len()
-                    .saturating_sub(1);
-
-
-            if scan_buffer.len()
-                > keep
+            // Prevent a malformed/no-separator stream from causing unlimited
+            // memory growth.
+            if parse_buffer.len()
+                > 16 * 1024
             {
-                let remove =
-                    scan_buffer.len()
-                        - keep;
+                let keep =
+                    4096;
 
 
-                scan_buffer.drain(
-                    ..remove
+                let drain =
+                    parse_buffer.len()
+                        .saturating_sub(
+                            keep
+                        );
+
+
+                parse_buffer.drain(
+                    ..drain
                 );
             }
         }
+
+
+        logging::trace(
+            "PLAYER",
+            format_args!(
+                "ffplay stderr monitor stopped"
+            ),
+        );
     });
 
 
@@ -327,6 +481,13 @@ fn find_ffplay(
 
 
         if path.exists() {
+            logging::trace(
+                "PLAYER",
+                format_args!(
+                    "Using PGC_FFPLAY_PATH override"
+                ),
+            );
+
             return Ok(path);
         }
     }
@@ -358,6 +519,15 @@ fn find_ffplay(
         if !brew.exists() {
             continue;
         }
+
+
+        logging::trace(
+            "PLAYER",
+            format_args!(
+                "Checking Homebrew: {}",
+                brew.display()
+            ),
+        );
 
 
         let output =

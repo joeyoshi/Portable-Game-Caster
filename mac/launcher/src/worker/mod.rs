@@ -3,6 +3,7 @@ mod reconnect;
 use std::process::Child;
 use std::sync::{
     mpsc::{
+        Receiver,
         Sender,
         TryRecvError,
     },
@@ -10,9 +11,13 @@ use std::sync::{
     Mutex,
 };
 use std::thread;
-use std::time::Duration;
+use std::time::{
+    Duration,
+    Instant,
+};
 
 use crate::discovery;
+use crate::logging;
 use crate::player;
 use crate::state::AppState;
 
@@ -21,11 +26,16 @@ pub type SharedPlayer =
     Arc<Mutex<Option<Child>>>;
 
 
+const INITIAL_MEDIA_TIMEOUT:
+    Duration =
+        Duration::from_secs(10);
+
+
 // -----------------------------------------------------------------------------
-// Player monitoring result
+// Player status
 // -----------------------------------------------------------------------------
 
-enum PlayerPoll {
+pub(crate) enum PlayerPoll {
     Running,
 
     ExitedSuccessfully,
@@ -46,14 +56,16 @@ pub fn run_stream_flow(
     tx: Sender<AppState>,
     player_handle: SharedPlayer,
 ) {
-    let send = |state: AppState| {
-        let _ = tx.send(state);
-    };
+    let send =
+        |state: AppState| {
+            logging::state(
+                &state
+            );
 
+            let _ =
+                tx.send(state);
+        };
 
-    // -------------------------------------------------------------------------
-    // Discover host
-    // -------------------------------------------------------------------------
 
     send(
         AppState::Discovering
@@ -82,10 +94,6 @@ pub fn run_stream_flow(
         endpoint.host.clone();
 
 
-    // -------------------------------------------------------------------------
-    // Resolve
-    // -------------------------------------------------------------------------
-
     send(
         AppState::Resolving(
             host.clone()
@@ -93,14 +101,20 @@ pub fn run_stream_flow(
     );
 
 
-    // -------------------------------------------------------------------------
-    // Connect to MediaMTX
-    // -------------------------------------------------------------------------
-
     send(
         AppState::Connecting(
             host.clone()
         )
+    );
+
+
+    logging::debug(
+        "CONNECT",
+        format_args!(
+            "Checking RTSP service at {}:{}",
+            endpoint.address,
+            endpoint.port
+        ),
     );
 
 
@@ -120,9 +134,13 @@ pub fn run_stream_flow(
     }
 
 
-    // -------------------------------------------------------------------------
-    // Launch initial player
-    // -------------------------------------------------------------------------
+    logging::debug(
+        "CONNECT",
+        format_args!(
+            "RTSP service reachable"
+        ),
+    );
+
 
     send(
         AppState::WaitingForStream(
@@ -152,35 +170,116 @@ pub fn run_stream_flow(
         };
 
 
-    // -------------------------------------------------------------------------
-    // Temporary startup readiness test
-    // -------------------------------------------------------------------------
-
-    thread::sleep(
-        Duration::from_secs(1)
+    logging::debug(
+        "HEALTH",
+        format_args!(
+            "Waiting for confirmed media flow"
+        ),
     );
 
 
-    if let Err(error) =
-        confirm_player_alive(
-            &player_handle
-        )
-    {
-        send(
-            AppState::Error(
-                error
-            )
-        );
+    match wait_for_media_start(
+        &transport_rx,
+        &player_handle,
+        Instant::now()
+            + INITIAL_MEDIA_TIMEOUT,
+    ) {
+        MediaStartResult::Started => {
+            send(
+                AppState::Playing(
+                    host.clone()
+                )
+            );
+        }
 
-        return;
+
+        MediaStartResult::ClosedNormally => {
+            clear_player(
+                &player_handle
+            );
+
+            send(
+                AppState::Idle
+            );
+
+            return;
+        }
+
+
+        MediaStartResult::Lost
+        | MediaStartResult::Exited
+        | MediaStartResult::MonitorError => {
+            terminate_player(
+                &player_handle
+            );
+
+
+            send(
+                AppState::ReconnectingStream {
+                    host:
+                        host.clone(),
+
+                    seconds_remaining:
+                        5,
+                }
+            );
+
+
+            match reconnect::attempt_reconnect(
+                &send,
+                &mut endpoint,
+                &player_handle,
+            ) {
+                reconnect::ReconnectResult::Recovered(
+                    receiver
+                ) => {
+                    transport_rx =
+                        receiver;
+                }
+
+
+                reconnect::ReconnectResult::Failed => {
+                    send(
+                        AppState::Idle
+                    );
+
+                    return;
+                }
+            }
+        }
+
+
+        MediaStartResult::TimedOut => {
+            logging::debug(
+                "HEALTH",
+                format_args!(
+                    "ffplay started but no media flow was confirmed within 10 seconds"
+                ),
+            );
+
+
+            terminate_player(
+                &player_handle
+            );
+
+
+            send(
+                AppState::Error(
+                    format!(
+                        "Connected to {host}, but the stream did not begin producing media."
+                    )
+                )
+            );
+
+
+            return;
+        }
+
+
+        MediaStartResult::Missing => {
+            return;
+        }
     }
-
-
-    send(
-        AppState::Playing(
-            host.clone()
-        )
-    );
 
 
     // -------------------------------------------------------------------------
@@ -189,22 +288,18 @@ pub fn run_stream_flow(
 
     loop {
         thread::sleep(
-            Duration::from_millis(250)
+            Duration::from_millis(100)
         );
 
 
         // ---------------------------------------------------------------------
-        // Transport-level failure
-        //
-        // ffplay may remain alive even after RTSP dies, so the stderr monitor
-        // reports transport loss separately from child-process status.
+        // ffplay-derived transport/media events
         // ---------------------------------------------------------------------
 
         match transport_rx.try_recv() {
             Ok(
                 player::TransportEvent::Lost
             ) => {
-                // Leave Connected immediately.
                 send(
                     AppState::ReconnectingStream {
                         host:
@@ -216,7 +311,6 @@ pub fn run_stream_flow(
                 );
 
 
-                // ffplay is now attached to a dead RTSP session.
                 terminate_player(
                     &player_handle
                 );
@@ -228,11 +322,10 @@ pub fn run_stream_flow(
                     &player_handle,
                 ) {
                     reconnect::ReconnectResult::Recovered(
-                        new_transport_rx
+                        receiver
                     ) => {
                         transport_rx =
-                            new_transport_rx;
-
+                            receiver;
 
                         continue;
                     }
@@ -243,10 +336,17 @@ pub fn run_stream_flow(
                             AppState::Idle
                         );
 
-
                         return;
                     }
                 }
+            }
+
+
+            Ok(
+                player::TransportEvent::MediaStarted
+            ) => {
+                // This event belongs to a stream already marked Playing.
+                // No state change is needed.
             }
 
 
@@ -257,12 +357,7 @@ pub fn run_stream_flow(
 
             Err(
                 TryRecvError::Disconnected
-            ) => {
-                // The stderr-monitor thread naturally exits when ffplay exits.
-                //
-                // Child-process monitoring below remains authoritative for
-                // determining what happened to the player.
-            }
+            ) => {}
         }
 
 
@@ -273,18 +368,18 @@ pub fn run_stream_flow(
         match poll_player(
             &player_handle
         ) {
-            // -------------------------------------------------------------
-            // Everything is still running.
-            // -------------------------------------------------------------
-
             PlayerPoll::Running => {}
 
 
-            // -------------------------------------------------------------
-            // ffplay was closed normally by the user.
-            // -------------------------------------------------------------
-
             PlayerPoll::ExitedSuccessfully => {
+                logging::debug(
+                    "PLAYER",
+                    format_args!(
+                        "ffplay closed normally"
+                    ),
+                );
+
+
                 clear_player(
                     &player_handle
                 );
@@ -299,14 +394,16 @@ pub fn run_stream_flow(
             }
 
 
-            // -------------------------------------------------------------
-            // ffplay exited abnormally.
-            //
-            // Treat this as stream loss and attempt recovery.
-            // -------------------------------------------------------------
-
             PlayerPoll::ExitedUnexpectedly
             | PlayerPoll::MonitorError => {
+                logging::debug(
+                    "PLAYER",
+                    format_args!(
+                        "ffplay ended unexpectedly"
+                    ),
+                );
+
+
                 send(
                     AppState::ReconnectingStream {
                         host:
@@ -329,11 +426,10 @@ pub fn run_stream_flow(
                     &player_handle,
                 ) {
                     reconnect::ReconnectResult::Recovered(
-                        new_transport_rx
+                        receiver
                     ) => {
                         transport_rx =
-                            new_transport_rx;
-
+                            receiver;
 
                         continue;
                     }
@@ -344,19 +440,11 @@ pub fn run_stream_flow(
                             AppState::Idle
                         );
 
-
                         return;
                     }
                 }
             }
 
-
-            // -------------------------------------------------------------
-            // No child exists.
-            //
-            // Usually means AppKit intentionally terminated ffplay because
-            // the user quit PGC or closed the PGC window.
-            // -------------------------------------------------------------
 
             PlayerPoll::Missing => {
                 return;
@@ -367,9 +455,107 @@ pub fn run_stream_flow(
 
 
 // -----------------------------------------------------------------------------
-// Launch ffplay
-//
-// Returns the transport receiver associated with this specific player instance.
+// Media-start result
+// -----------------------------------------------------------------------------
+
+pub(crate) enum MediaStartResult {
+    Started,
+
+    Lost,
+
+    ClosedNormally,
+
+    Exited,
+
+    MonitorError,
+
+    Missing,
+
+    TimedOut,
+}
+
+
+// -----------------------------------------------------------------------------
+// Wait until actual decoded media begins
+// -----------------------------------------------------------------------------
+
+pub(crate) fn wait_for_media_start(
+    transport_rx: &Receiver<
+        player::TransportEvent
+    >,
+    player_handle: &SharedPlayer,
+    deadline: Instant,
+) -> MediaStartResult {
+    loop {
+        if Instant::now()
+            >= deadline
+        {
+            return MediaStartResult::TimedOut;
+        }
+
+
+        match transport_rx.try_recv() {
+            Ok(
+                player::TransportEvent::MediaStarted
+            ) => {
+                return MediaStartResult::Started;
+            }
+
+
+            Ok(
+                player::TransportEvent::Lost
+            ) => {
+                return MediaStartResult::Lost;
+            }
+
+
+            Err(
+                TryRecvError::Empty
+            ) => {}
+
+
+            Err(
+                TryRecvError::Disconnected
+            ) => {}
+        }
+
+
+        match poll_player(
+            player_handle
+        ) {
+            PlayerPoll::Running => {}
+
+
+            PlayerPoll::ExitedSuccessfully => {
+                return MediaStartResult::ClosedNormally;
+            }
+
+
+            PlayerPoll::ExitedUnexpectedly => {
+                return MediaStartResult::Exited;
+            }
+
+
+            PlayerPoll::MonitorError => {
+                return MediaStartResult::MonitorError;
+            }
+
+
+            PlayerPoll::Missing => {
+                return MediaStartResult::Missing;
+            }
+        }
+
+
+        thread::sleep(
+            Duration::from_millis(100)
+        );
+    }
+}
+
+
+// -----------------------------------------------------------------------------
+// Launch player
 // -----------------------------------------------------------------------------
 
 pub(crate) fn launch_player(
@@ -412,69 +598,10 @@ pub(crate) fn launch_player(
 
 
 // -----------------------------------------------------------------------------
-// Confirm ffplay survived startup
+// Poll player
 // -----------------------------------------------------------------------------
 
-pub(crate) fn confirm_player_alive(
-    player_handle: &SharedPlayer,
-) -> Result<(), String> {
-    let mut slot =
-        player_handle
-            .lock()
-            .expect(
-                "player process lock poisoned"
-            );
-
-
-    let Some(child) =
-        slot.as_mut()
-    else {
-        return Err(
-            "Player process disappeared during startup."
-                .into()
-        );
-    };
-
-
-    match child.try_wait() {
-        Ok(Some(status)) => {
-            *slot =
-                None;
-
-
-            Err(
-                format!(
-                    "Player exited before the stream started ({status})."
-                )
-            )
-        }
-
-
-        Ok(None) => {
-            Ok(())
-        }
-
-
-        Err(error) => {
-            *slot =
-                None;
-
-
-            Err(
-                format!(
-                    "Could not monitor player: {error}"
-                )
-            )
-        }
-    }
-}
-
-
-// -----------------------------------------------------------------------------
-// Poll active ffplay process
-// -----------------------------------------------------------------------------
-
-fn poll_player(
+pub(crate) fn poll_player(
     player_handle: &SharedPlayer,
 ) -> PlayerPoll {
     let mut slot =
@@ -518,12 +645,10 @@ fn poll_player(
 
 
 // -----------------------------------------------------------------------------
-// Terminate an active stale ffplay instance
-//
-// Used when transport has died but ffplay itself remains alive.
+// Kill stale player
 // -----------------------------------------------------------------------------
 
-fn terminate_player(
+pub(crate) fn terminate_player(
     player_handle: &SharedPlayer,
 ) {
     let mut slot =
@@ -537,6 +662,15 @@ fn terminate_player(
     if let Some(child) =
         slot.as_mut()
     {
+        logging::debug(
+            "PLAYER",
+            format_args!(
+                "Terminating ffplay PID {}",
+                child.id()
+            ),
+        );
+
+
         let _ =
             child.kill();
 
@@ -552,7 +686,7 @@ fn terminate_player(
 
 
 // -----------------------------------------------------------------------------
-// Remove finished player from shared ownership
+// Clear finished player
 // -----------------------------------------------------------------------------
 
 pub(crate) fn clear_player(
