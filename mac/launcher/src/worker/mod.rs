@@ -2,7 +2,10 @@ mod reconnect;
 
 use std::process::Child;
 use std::sync::{
-    mpsc::Sender,
+    mpsc::{
+        Sender,
+        TryRecvError,
+    },
     Arc,
     Mutex,
 };
@@ -16,7 +19,6 @@ use crate::state::AppState;
 
 pub type SharedPlayer =
     Arc<Mutex<Option<Child>>>;
-
 
 
 // -----------------------------------------------------------------------------
@@ -119,7 +121,7 @@ pub fn run_stream_flow(
 
 
     // -------------------------------------------------------------------------
-    // Launch player
+    // Launch initial player
     // -------------------------------------------------------------------------
 
     send(
@@ -129,28 +131,33 @@ pub fn run_stream_flow(
     );
 
 
-    if let Err(error) =
-        launch_player(
+    let mut transport_rx =
+        match launch_player(
             &endpoint,
             &player_handle,
-        )
-    {
-        send(
-            AppState::Error(
-                error
-            )
-        );
+        ) {
+            Ok(receiver) => {
+                receiver
+            }
 
-        return;
-    }
+            Err(error) => {
+                send(
+                    AppState::Error(
+                        error
+                    )
+                );
+
+                return;
+            }
+        };
 
 
     // -------------------------------------------------------------------------
-    // Temporary readiness test
+    // Temporary startup readiness test
     // -------------------------------------------------------------------------
 
     thread::sleep(
-        Duration::from_millis(250)
+        Duration::from_secs(1)
     );
 
 
@@ -177,18 +184,7 @@ pub fn run_stream_flow(
 
 
     // -------------------------------------------------------------------------
-    // Active playback monitor
-    //
-    // IMPORTANT:
-    //
-    // ffplay does not necessarily exit when its RTSP connection dies.
-    // It can remain alive indefinitely while printing EOF / connection-reset
-    // messages.
-    //
-    // Because of that, we monitor BOTH:
-    //
-    // 1. the ffplay child process
-    // 2. the MediaMTX RTSP TCP service
+    // Active playback lifecycle
     // -------------------------------------------------------------------------
 
     loop {
@@ -198,23 +194,94 @@ pub fn run_stream_flow(
 
 
         // ---------------------------------------------------------------------
-        // First check whether ffplay itself exited.
+        // Transport-level failure
+        //
+        // ffplay may remain alive even after RTSP dies, so the stderr monitor
+        // reports transport loss separately from child-process status.
+        // ---------------------------------------------------------------------
+
+        match transport_rx.try_recv() {
+            Ok(
+                player::TransportEvent::Lost
+            ) => {
+                // Leave Connected immediately.
+                send(
+                    AppState::ReconnectingStream {
+                        host:
+                            endpoint.host.clone(),
+
+                        seconds_remaining:
+                            5,
+                    }
+                );
+
+
+                // ffplay is now attached to a dead RTSP session.
+                terminate_player(
+                    &player_handle
+                );
+
+
+                match reconnect::attempt_reconnect(
+                    &send,
+                    &mut endpoint,
+                    &player_handle,
+                ) {
+                    reconnect::ReconnectResult::Recovered(
+                        new_transport_rx
+                    ) => {
+                        transport_rx =
+                            new_transport_rx;
+
+
+                        continue;
+                    }
+
+
+                    reconnect::ReconnectResult::Failed => {
+                        send(
+                            AppState::Idle
+                        );
+
+
+                        return;
+                    }
+                }
+            }
+
+
+            Err(
+                TryRecvError::Empty
+            ) => {}
+
+
+            Err(
+                TryRecvError::Disconnected
+            ) => {
+                // The stderr-monitor thread naturally exits when ffplay exits.
+                //
+                // Child-process monitoring below remains authoritative for
+                // determining what happened to the player.
+            }
+        }
+
+
+        // ---------------------------------------------------------------------
+        // Child-process lifecycle
         // ---------------------------------------------------------------------
 
         match poll_player(
             &player_handle
         ) {
             // -------------------------------------------------------------
-            // Still running.
-            //
-            // Continue below and independently verify RTSP health.
+            // Everything is still running.
             // -------------------------------------------------------------
 
             PlayerPoll::Running => {}
 
 
             // -------------------------------------------------------------
-            // User closed ffplay normally.
+            // ffplay was closed normally by the user.
             // -------------------------------------------------------------
 
             PlayerPoll::ExitedSuccessfully => {
@@ -233,36 +300,62 @@ pub fn run_stream_flow(
 
 
             // -------------------------------------------------------------
-            // ffplay itself crashed.
+            // ffplay exited abnormally.
+            //
+            // Treat this as stream loss and attempt recovery.
             // -------------------------------------------------------------
 
             PlayerPoll::ExitedUnexpectedly
             | PlayerPoll::MonitorError => {
+                send(
+                    AppState::ReconnectingStream {
+                        host:
+                            endpoint.host.clone(),
+
+                        seconds_remaining:
+                            5,
+                    }
+                );
+
+
                 clear_player(
                     &player_handle
                 );
 
 
-                if reconnect_after_loss(
+                match reconnect::attempt_reconnect(
                     &send,
                     &mut endpoint,
                     &player_handle,
                 ) {
-                    continue;
+                    reconnect::ReconnectResult::Recovered(
+                        new_transport_rx
+                    ) => {
+                        transport_rx =
+                            new_transport_rx;
+
+
+                        continue;
+                    }
+
+
+                    reconnect::ReconnectResult::Failed => {
+                        send(
+                            AppState::Idle
+                        );
+
+
+                        return;
+                    }
                 }
-
-
-                send(
-                    AppState::Idle
-                );
-
-
-                return;
             }
 
 
             // -------------------------------------------------------------
-            // Usually means AppKit deliberately killed ffplay during Quit.
+            // No child exists.
+            //
+            // Usually means AppKit intentionally terminated ffplay because
+            // the user quit PGC or closed the PGC window.
             // -------------------------------------------------------------
 
             PlayerPoll::Missing => {
@@ -274,43 +367,22 @@ pub fn run_stream_flow(
 
 
 // -----------------------------------------------------------------------------
-// Run the reconnect subsystem after playback/service loss
-// -----------------------------------------------------------------------------
-
-fn reconnect_after_loss<F>(
-    send: &F,
-    endpoint: &mut discovery::StreamEndpoint,
-    player_handle: &SharedPlayer,
-) -> bool
-where
-    F: Fn(AppState),
-{
-    match reconnect::attempt_reconnect(
-        send,
-        endpoint,
-        player_handle,
-    ) {
-        reconnect::ReconnectResult::Recovered => {
-            true
-        }
-
-        reconnect::ReconnectResult::Failed => {
-            false
-        }
-    }
-}
-
-
-
-// -----------------------------------------------------------------------------
-// Launch ffplay and store its Child handle
+// Launch ffplay
+//
+// Returns the transport receiver associated with this specific player instance.
 // -----------------------------------------------------------------------------
 
 pub(crate) fn launch_player(
     endpoint: &discovery::StreamEndpoint,
     player_handle: &SharedPlayer,
-) -> Result<(), String> {
-    let child =
+) -> Result<
+    player::TransportReceiver,
+    String,
+> {
+    let (
+        child,
+        transport_rx,
+    ) =
         player::launch_ffplay(
             &endpoint.url()
         )
@@ -333,7 +405,9 @@ pub(crate) fn launch_player(
         Some(child);
 
 
-    Ok(())
+    Ok(
+        transport_rx
+    )
 }
 
 
@@ -397,7 +471,7 @@ pub(crate) fn confirm_player_alive(
 
 
 // -----------------------------------------------------------------------------
-// Check active player
+// Poll active ffplay process
 // -----------------------------------------------------------------------------
 
 fn poll_player(
@@ -444,7 +518,41 @@ fn poll_player(
 
 
 // -----------------------------------------------------------------------------
-// Remove finished player from the shared slot
+// Terminate an active stale ffplay instance
+//
+// Used when transport has died but ffplay itself remains alive.
+// -----------------------------------------------------------------------------
+
+fn terminate_player(
+    player_handle: &SharedPlayer,
+) {
+    let mut slot =
+        player_handle
+            .lock()
+            .expect(
+                "player process lock poisoned"
+            );
+
+
+    if let Some(child) =
+        slot.as_mut()
+    {
+        let _ =
+            child.kill();
+
+
+        let _ =
+            child.wait();
+    }
+
+
+    *slot =
+        None;
+}
+
+
+// -----------------------------------------------------------------------------
+// Remove finished player from shared ownership
 // -----------------------------------------------------------------------------
 
 pub(crate) fn clear_player(

@@ -21,11 +21,16 @@ const RECONNECT_SECONDS: u8 = 5;
 
 
 // -----------------------------------------------------------------------------
-// Result returned to the main worker
+// Reconnect result
+//
+// A recovered connection includes the transport monitor belonging to the new
+// ffplay process.
 // -----------------------------------------------------------------------------
 
 pub enum ReconnectResult {
-    Recovered,
+    Recovered(
+        player::TransportReceiver
+    ),
 
     Failed,
 }
@@ -51,9 +56,7 @@ where
         (1..=RECONNECT_SECONDS).rev()
     {
         // ---------------------------------------------------------------------
-        // First test the last-known RTSP endpoint directly.
-        //
-        // If MediaMTX is already reachable again, we don't need mDNS.
+        // First try the last-known RTSP service.
         // ---------------------------------------------------------------------
 
         if player::check_stream_service(
@@ -72,10 +75,14 @@ where
             );
 
 
-            if try_restart_player(
-                endpoint,
-                player_handle,
-            ) {
+            if let Some(
+                transport_rx
+            ) =
+                try_restart_player(
+                    endpoint,
+                    player_handle,
+                )
+            {
                 send(
                     AppState::Playing(
                         host.clone()
@@ -83,15 +90,17 @@ where
                 );
 
 
-                return ReconnectResult::Recovered;
+                return ReconnectResult::Recovered(
+                    transport_rx
+                );
             }
         }
 
 
         // ---------------------------------------------------------------------
-        // RTSP is not reachable.
+        // RTSP isn't reachable.
         //
-        // Now ask mDNS whether the SAME PGC host still exists.
+        // Ask mDNS whether the SAME host is still advertised.
         // ---------------------------------------------------------------------
 
         let rediscovered =
@@ -103,12 +112,7 @@ where
 
         match rediscovered {
             // -----------------------------------------------------------------
-            // Host is still being advertised.
-            //
-            // This means the PGC host itself exists, but the stream service
-            // either died or hasn't recovered yet.
-            //
-            // This may also give us an updated IP address.
+            // Host exists, stream is unavailable/recovering.
             // -----------------------------------------------------------------
 
             Ok(
@@ -135,25 +139,32 @@ where
                     endpoint.port,
                 )
                 .is_ok()
-                    && try_restart_player(
-                        endpoint,
-                        player_handle,
-                    )
                 {
-                    send(
-                        AppState::Playing(
-                            host.clone()
+                    if let Some(
+                        transport_rx
+                    ) =
+                        try_restart_player(
+                            endpoint,
+                            player_handle,
                         )
-                    );
+                    {
+                        send(
+                            AppState::Playing(
+                                host.clone()
+                            )
+                        );
 
 
-                    return ReconnectResult::Recovered;
+                        return ReconnectResult::Recovered(
+                            transport_rx
+                        );
+                    }
                 }
             }
 
 
             // -----------------------------------------------------------------
-            // The PGC host itself is no longer discoverable.
+            // Same host isn't currently discoverable.
             // -----------------------------------------------------------------
 
             Ok(None) => {
@@ -169,8 +180,7 @@ where
 
 
             // -----------------------------------------------------------------
-            // Treat transient discovery failure as host unavailable for this
-            // retry cycle.
+            // Discovery itself failed during this attempt.
             // -----------------------------------------------------------------
 
             Err(_) => {
@@ -186,10 +196,6 @@ where
         }
 
 
-        // discover_host already consumes part of the second.
-        //
-        // This sleep keeps the countdown close to one visible update per
-        // second without artificially stretching it too far.
         thread::sleep(
             Duration::from_millis(650)
         );
@@ -201,30 +207,37 @@ where
 
 
 // -----------------------------------------------------------------------------
-// Relaunch ffplay and ensure it survives startup
+// Relaunch ffplay
+//
+// Success returns the new process's transport receiver.
 // -----------------------------------------------------------------------------
 
 fn try_restart_player(
     endpoint: &discovery::StreamEndpoint,
     player_handle: &SharedPlayer,
-) -> bool {
+) -> Option<
+    player::TransportReceiver
+> {
     clear_player(
         player_handle
     );
 
 
-    if launch_player(
-        endpoint,
-        player_handle,
-    )
-    .is_err()
-    {
-        return false;
-    }
+    let transport_rx =
+        match launch_player(
+            endpoint,
+            player_handle,
+        ) {
+            Ok(receiver) => {
+                receiver
+            }
+
+            Err(_) => {
+                return None;
+            }
+        };
 
 
-    // Give ffplay enough time to establish its RTSP session before deciding
-    // whether recovery succeeded.
     thread::sleep(
         Duration::from_millis(750)
     );
@@ -235,13 +248,15 @@ fn try_restart_player(
     )
     .is_ok()
     {
-        true
+        Some(
+            transport_rx
+        )
     } else {
         clear_player(
             player_handle
         );
 
 
-        false
+        None
     }
 }
