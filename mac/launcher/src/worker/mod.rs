@@ -1,3 +1,4 @@
+mod countdown;
 mod reconnect;
 
 use std::process::Child;
@@ -269,9 +270,7 @@ pub fn run_stream_flow(
             MediaWarmupResult::TimedOut => {
                 send(
                     AppState::Error(
-                        format!(
-                            "The streaming service at {host} was reachable, but the stream did not begin producing media within 25 seconds."
-                        )
+                        "Stream did not start.".into()
                     )
                 );
 
@@ -355,6 +354,48 @@ pub fn run_stream_flow(
                     "HEALTH",
                     format_args!(
                         "Active stream transport lost"
+                    ),
+                );
+
+
+                terminate_player(
+                    &player_handle
+                );
+
+
+                match recover_stream(
+                    &send,
+                    &mut endpoint,
+                    &player_handle,
+                    &cancellation,
+                ) {
+                    Some(
+                        new_receiver
+                    ) => {
+                        transport_rx =
+                            new_receiver;
+
+
+                        continue;
+                    }
+
+
+                    None => {
+                        return;
+                    }
+                }
+            }
+
+
+            // ffplay is still open, but media stopped advancing. Playing is
+            // no longer truthful, so treat it like a lost stream.
+            Ok(
+                player::TransportEvent::Stalled
+            ) => {
+                logging::debug(
+                    "HEALTH",
+                    format_args!(
+                        "Media stalled while Playing; entering stream recovery"
                     ),
                 );
 
@@ -505,7 +546,7 @@ fn recover_stream<F>(
     player::TransportReceiver
 >
 where
-    F: Fn(AppState),
+    F: Fn(AppState) + Sync,
 {
     let host =
         endpoint.host.clone();
@@ -649,9 +690,7 @@ where
 
                 send(
                     AppState::Error(
-                        format!(
-                            "Connection to {host} was restored, but the stream did not begin producing media within 25 seconds."
-                        )
+                        "Stream did not resume.".into()
                     )
                 );
 
@@ -702,7 +741,7 @@ fn wait_for_media_with_retries<F>(
     cancellation: &AtomicBool,
 ) -> MediaWarmupResult
 where
-    F: Fn(AppState),
+    F: Fn(AppState) + Sync,
 {
     let warmup_started =
         Instant::now();
@@ -716,6 +755,66 @@ where
     let deadline =
         warmup_started
             + timeout;
+
+
+    let countdown_stopped =
+        AtomicBool::new(false);
+
+
+    // The visible fallback countdown runs on its own thread so its pacing
+    // follows the deadline rather than the probe/launch/retry loop below.
+    thread::scope(
+        |scope| {
+            let ticker =
+                scope.spawn(
+                    || {
+                        run_media_warmup_countdown(
+                            send,
+                            &endpoint.host,
+                            grace_deadline,
+                            deadline,
+                            &countdown_stopped,
+                        );
+                    }
+                );
+
+
+            let result =
+                wait_for_media(
+                    endpoint,
+                    player_handle,
+                    warmup_started,
+                    deadline,
+                    cancellation,
+                );
+
+
+            countdown_stopped.store(
+                true,
+                Ordering::Relaxed,
+            );
+
+            ticker.thread().unpark();
+
+
+            result
+        }
+    )
+}
+
+
+fn wait_for_media(
+    endpoint: &discovery::StreamEndpoint,
+    player_handle: &SharedPlayer,
+    warmup_started: Instant,
+    deadline: Instant,
+    cancellation: &AtomicBool,
+) -> MediaWarmupResult {
+    let timeout =
+        deadline
+            .saturating_duration_since(
+                warmup_started
+            );
 
 
     logging::debug(
@@ -737,15 +836,6 @@ where
     );
 
 
-    let mut fallback_started =
-        false;
-
-
-    let mut last_fallback_seconds:
-        Option<u8> =
-            None;
-
-
     while Instant::now()
         < deadline
     {
@@ -753,16 +843,6 @@ where
             terminate_player(player_handle);
             return MediaWarmupResult::Cancelled;
         }
-
-        update_media_warmup_state(
-            send,
-            &endpoint.host,
-            grace_deadline,
-            deadline,
-            &mut fallback_started,
-            &mut last_fallback_seconds,
-        );
-
 
         // ---------------------------------------------------------------------
         // Is RTSP still reachable?
@@ -835,16 +915,6 @@ where
                 return MediaWarmupResult::Cancelled;
             }
 
-            update_media_warmup_state(
-                send,
-                &endpoint.host,
-                grace_deadline,
-                deadline,
-                &mut fallback_started,
-                &mut last_fallback_seconds,
-            );
-
-
             if Instant::now()
                 >= deadline
             {
@@ -916,6 +986,12 @@ where
 
                     break;
                 }
+
+
+                // Only reported after MediaStarted, which returns above.
+                Ok(
+                    player::TransportEvent::Stalled
+                ) => {}
 
 
                 Err(
@@ -1010,100 +1086,70 @@ where
 // Media warm-up UI and diagnostics
 // -----------------------------------------------------------------------------
 
-fn update_media_warmup_state<F>(
+fn run_media_warmup_countdown<F>(
     send: &F,
     host: &str,
     grace_deadline: Instant,
     deadline: Instant,
-    fallback_started: &mut bool,
-    last_fallback_seconds: &mut Option<u8>,
+    stopped: &AtomicBool,
 )
 where
     F: Fn(AppState),
 {
-    let now =
-        Instant::now();
+    let mut last_fallback_seconds:
+        Option<u8> =
+            None;
 
 
-    if now < grace_deadline {
-        return;
-    }
+    countdown::run(
+        grace_deadline,
+        deadline,
+        MEDIA_WARMUP_FALLBACK_TIMEOUT.as_secs() as u8,
+        stopped,
+        |seconds_remaining| {
+            if last_fallback_seconds.is_none() {
+                logging::debug(
+                    "HEALTH",
+                    format_args!(
+                        "Initial {}-second media warm-up grace period expired",
+                        MEDIA_WARMUP_GRACE_PERIOD.as_secs()
+                    ),
+                );
 
 
-    if !*fallback_started {
-        *fallback_started = true;
+                logging::debug(
+                    "HEALTH",
+                    format_args!(
+                        "Starting visible {}-second media warm-up fallback countdown",
+                        MEDIA_WARMUP_FALLBACK_TIMEOUT.as_secs()
+                    ),
+                );
+            }
 
 
-        logging::debug(
-            "HEALTH",
-            format_args!(
-                "Initial {}-second media warm-up grace period expired",
-                MEDIA_WARMUP_GRACE_PERIOD.as_secs()
-            ),
-        );
+            if last_fallback_seconds
+                == Some(
+                    seconds_remaining
+                )
+            {
+                return;
+            }
 
 
-        logging::debug(
-            "HEALTH",
-            format_args!(
-                "Starting visible {}-second media warm-up fallback countdown",
-                MEDIA_WARMUP_FALLBACK_TIMEOUT.as_secs()
-            ),
-        );
-    }
+            last_fallback_seconds =
+                Some(
+                    seconds_remaining
+                );
 
 
-    let seconds_remaining =
-        countdown_seconds_remaining(
-            deadline,
-            MEDIA_WARMUP_FALLBACK_TIMEOUT.as_secs() as u8,
-        );
-
-
-    if *last_fallback_seconds
-        == Some(
-            seconds_remaining
-        )
-    {
-        return;
-    }
-
-
-    *last_fallback_seconds =
-        Some(
-            seconds_remaining
-        );
-
-
-    send(
-        AppState::WaitingForStream {
-            host: host.to_string(),
-            fallback_seconds_remaining: Some(seconds_remaining),
-        }
+            send(
+                AppState::WaitingForStream {
+                    host: host.to_string(),
+                    fallback_seconds_remaining: Some(seconds_remaining),
+                }
+            );
+        },
     );
-}
-
-
-fn countdown_seconds_remaining(
-    deadline: Instant,
-    maximum: u8,
-) -> u8 {
-    let milliseconds =
-        deadline
-            .saturating_duration_since(
-                Instant::now()
-            )
-            .as_millis();
-
-
-    if milliseconds == 0 {
-        return 0;
-    }
-
-
-    ((milliseconds + 999) / 1000)
-        .min(maximum as u128)
-        as u8
 }
 
 

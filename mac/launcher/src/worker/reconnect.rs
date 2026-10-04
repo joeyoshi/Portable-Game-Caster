@@ -13,6 +13,8 @@ use crate::logging;
 use crate::player;
 use crate::state::AppState;
 
+use super::countdown;
+
 
 // -----------------------------------------------------------------------------
 // Reconnect policy
@@ -63,7 +65,7 @@ pub fn restore_handshake<F>(
     cancelled: &AtomicBool,
 ) -> ReconnectResult
 where
-    F: Fn(AppState),
+    F: Fn(AppState) + Sync,
 {
     let host =
         endpoint.host.clone();
@@ -82,25 +84,101 @@ where
     );
 
 
-    let mut last_state:
-        Option<(
-            bool,
-            u8,
-        )> =
-            None;
+    let host_missing =
+        AtomicBool::new(false);
 
 
+    let countdown_stopped =
+        AtomicBool::new(false);
+
+
+    // The visible countdown runs on its own thread so its pacing follows the
+    // deadline rather than the duration of each probe/rediscovery iteration.
+    thread::scope(
+        |scope| {
+            let ticker =
+                scope.spawn(
+                    || {
+                        // recover_stream has already shown the full countdown.
+                        let mut last_state =
+                            Some(
+                                (
+                                    false,
+                                    RECONNECT_TIMEOUT.as_secs() as u8,
+                                )
+                            );
+
+
+                        countdown::run(
+                            Instant::now(),
+                            deadline,
+                            RECONNECT_TIMEOUT.as_secs() as u8,
+                            &countdown_stopped,
+                            |seconds| {
+                                emit_reconnect_state(
+                                    send,
+                                    &host,
+                                    host_missing.load(Ordering::Relaxed),
+                                    seconds,
+                                    &mut last_state,
+                                );
+                            },
+                        );
+                    }
+                );
+
+
+            // Reflect a host-present/host-missing change immediately instead
+            // of waiting for the next whole-second tick.
+            let set_host_missing =
+                |missing: bool| {
+                    if host_missing.swap(
+                        missing,
+                        Ordering::Relaxed,
+                    ) != missing
+                    {
+                        ticker.thread().unpark();
+                    }
+                };
+
+
+            let result =
+                probe_until_restored(
+                    endpoint,
+                    &host,
+                    deadline,
+                    cancelled,
+                    &set_host_missing,
+                );
+
+
+            countdown_stopped.store(
+                true,
+                Ordering::Relaxed,
+            );
+
+            ticker.thread().unpark();
+
+
+            result
+        }
+    )
+}
+
+
+fn probe_until_restored(
+    endpoint: &mut discovery::StreamEndpoint,
+    host: &str,
+    deadline: Instant,
+    cancelled: &AtomicBool,
+    set_host_missing: &dyn Fn(bool),
+) -> ReconnectResult {
     while Instant::now()
         < deadline
     {
         if cancelled.load(Ordering::Relaxed) {
             return ReconnectResult::Cancelled;
         }
-
-        let seconds =
-            seconds_remaining(
-                deadline
-            );
 
 
         // ---------------------------------------------------------------------
@@ -135,7 +213,7 @@ where
         // ---------------------------------------------------------------------
 
         match discovery::discover_host(
-            &host,
+            host,
             Duration::from_millis(
                 300
             ),
@@ -150,13 +228,7 @@ where
                     updated_endpoint;
 
 
-                emit_reconnect_state(
-                    send,
-                    &host,
-                    false,
-                    seconds,
-                    &mut last_state,
-                );
+                set_host_missing(false);
 
 
                 logging::trace(
@@ -170,24 +242,12 @@ where
 
 
             Ok(None) => {
-                emit_reconnect_state(
-                    send,
-                    &host,
-                    true,
-                    seconds,
-                    &mut last_state,
-                );
+                set_host_missing(true);
             }
 
 
             Err(error) => {
-                emit_reconnect_state(
-                    send,
-                    &host,
-                    true,
-                    seconds,
-                    &mut last_state,
-                );
+                set_host_missing(true);
 
 
                 logging::trace(
@@ -280,42 +340,4 @@ where
             }
         );
     }
-}
-
-
-// -----------------------------------------------------------------------------
-// Human-readable ceiling countdown
-// -----------------------------------------------------------------------------
-
-fn seconds_remaining(
-    deadline: Instant,
-) -> u8 {
-    let remaining =
-        deadline
-            .saturating_duration_since(
-                Instant::now()
-            );
-
-
-    let millis =
-        remaining
-            .as_millis();
-
-
-    if millis == 0 {
-        return 0;
-    }
-
-
-    let seconds =
-        (
-            millis
-                + 999
-        )
-            / 1000;
-
-
-    seconds
-        .min(15)
-        as u8
 }

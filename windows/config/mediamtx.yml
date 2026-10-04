@@ -881,20 +881,25 @@ pathDefaults:
 # for example "~^prefix" will match all paths that start with "prefix".
 paths:
   gameplay:
-    runOnDemand: >-
-      powershell.exe
-      -NoProfile
-      -ExecutionPolicy Bypass
-      -File C:/MediaMTX/start-gameplay.ps1
+    # Demand signal only. MediaMTX does not launch or own FFmpeg.
+    #
+    # When a reader asks for this path and nobody is publishing, MediaMTX runs
+    # the PGC Host executable in --demand-signal mode. That process holds a
+    # localhost connection to the Host for as long as MediaMTX considers the
+    # path in demand; the Host starts, restarts, and stops FFmpeg itself.
+    #
+    # PGC_HOST_EXE and PGC_DEMAND_ADDR are set by the Host when it starts
+    # MediaMTX, so MediaMTX must be started by the PGC Host.
+    runOnDemand: $PGC_HOST_EXE --demand-signal
 
-    runOnDemandRestart: true
+    # The signal process has nothing to restart; the Host owns FFmpeg restarts.
+    runOnDemandRestart: false
+
+    # Readers are held until FFmpeg is publishing or this much time has passed.
     runOnDemandStartTimeout: 15s
-    runOnDemandCloseAfter: 5s
 
-    runOnUnDemand: >-
-      powershell.exe
-      -NoProfile
-      -ExecutionPolicy Bypass
-      -File C:/MediaMTX/stop-gameplay.ps1
+    # How long after the last reader leaves before MediaMTX ends the demand
+    # signal. The Host then keeps FFmpeg for its own short grace period.
+    runOnDemandCloseAfter: 10s
 
   all_others:

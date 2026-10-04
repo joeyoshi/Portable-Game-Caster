@@ -20,7 +20,10 @@ use std::sync::mpsc::{
     Receiver,
 };
 use std::thread;
-use std::time::Duration;
+use std::time::{
+    Duration,
+    Instant,
+};
 
 use crate::logging;
 
@@ -69,11 +72,121 @@ pub enum TransportEvent {
     ),
 
     Lost,
+
+    // ffplay is still running and printing status, but nothing in its status
+    // line has changed for MEDIA_STALL_THRESHOLD.
+    Stalled,
 }
 
 
 pub type TransportReceiver =
     Receiver<TransportEvent>;
+
+
+// -----------------------------------------------------------------------------
+// Media liveness
+//
+// With `-sync ext`, the first column of ffplay's status line (master clock)
+// keeps advancing with wall time even when no media arrives, so it is not a
+// progress signal. Everything after it (A-V/M-V drift, dropped frames, queue
+// sizes) jitters continuously while media is decoded and freezes completely
+// when the source stops or the connection ends without an error.
+// -----------------------------------------------------------------------------
+
+const MEDIA_STALL_THRESHOLD:
+    Duration =
+        Duration::from_secs(5);
+
+
+struct MediaProgress {
+    fingerprint:
+        String,
+
+    last_change:
+        Option<Instant>,
+}
+
+
+impl MediaProgress {
+    fn new() -> Self {
+        Self {
+            fingerprint:
+                String::new(),
+
+            last_change:
+                None,
+        }
+    }
+
+
+    // Returns how long the status line has gone without changing.
+    fn observe(
+        &mut self,
+        fingerprint: &str,
+        now: Instant,
+    ) -> Duration {
+        match self.last_change {
+            Some(last_change)
+                if self.fingerprint == fingerprint =>
+            {
+                now.saturating_duration_since(
+                    last_change
+                )
+            }
+
+
+            _ => {
+                self.fingerprint.clear();
+
+                self.fingerprint.push_str(
+                    fingerprint
+                );
+
+                self.last_change =
+                    Some(now);
+
+                Duration::ZERO
+            }
+        }
+    }
+}
+
+
+// Returns an ffplay status line with the leading master-clock column removed,
+// or None when the text is not a status line.
+fn stats_fingerprint(
+    text: &str,
+) -> Option<&str> {
+    let (
+        clock,
+        rest,
+    ) =
+        text
+            .trim()
+            .split_once(
+                char::is_whitespace
+            )?;
+
+
+    if !clock
+        .parse::<f64>()
+        .is_ok_and(f64::is_finite)
+    {
+        return None;
+    }
+
+
+    if !rest.contains("aq=")
+        && !rest.contains("vq=")
+    {
+        return None;
+    }
+
+
+    Some(
+        rest.trim()
+    )
+}
 
 
 // -----------------------------------------------------------------------------
@@ -282,6 +395,14 @@ pub fn launch_ffplay(
                 false;
 
 
+            let mut media_progress =
+                MediaProgress::new();
+
+
+            let mut stall_reported =
+                false;
+
+
             loop {
                 let bytes_read =
                     match ffplay_stderr.read(
@@ -453,6 +574,50 @@ pub fn launch_ffplay(
 
                         media_reported =
                             true;
+                    }
+
+
+                    // -----------------------------------------------------
+                    // Continuing media flow
+                    // -----------------------------------------------------
+
+                    if media_reported
+                        && !stall_reported
+                    {
+                        if let Some(fingerprint) =
+                            stats_fingerprint(
+                                &text
+                            )
+                        {
+                            let stalled_for =
+                                media_progress.observe(
+                                    fingerprint,
+                                    Instant::now(),
+                                );
+
+
+                            if stalled_for
+                                >= MEDIA_STALL_THRESHOLD
+                            {
+                                logging::debug(
+                                    "HEALTH",
+                                    format_args!(
+                                        "Media progress stalled for {:.1}s",
+                                        stalled_for.as_secs_f64()
+                                    ),
+                                );
+
+
+                                let _ =
+                                    transport_tx.send(
+                                        TransportEvent::Stalled
+                                    );
+
+
+                                stall_reported =
+                                    true;
+                            }
+                        }
                     }
                 }
 
@@ -1159,4 +1324,181 @@ fn find_ffplay(
         "Could not find ffplay from the Homebrew ffmpeg-full package."
             .into()
     )
+}
+
+
+// -----------------------------------------------------------------------------
+// Tests
+//
+// Status lines below were captured from ffplay 9.0.2 with the PGC player flags.
+// -----------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+
+    const HEALTHY_A: &str =
+        "   5.58 A-V: -0.091 fd=   0 aq=    0KB vq=   29KB sq=    0B ";
+
+    const HEALTHY_B: &str =
+        "   5.61 A-V: -0.087 fd=   0 aq=    0KB vq=   30KB sq=    0B ";
+
+    const FROZEN_A: &str =
+        "   9.71 A-V: -0.074 fd=   0 aq=    0KB vq=    0KB sq=    0B ";
+
+    const FROZEN_B: &str =
+        "  17.15 A-V: -0.074 fd=   0 aq=    0KB vq=    0KB sq=    0B ";
+
+
+    #[test]
+    fn fingerprint_drops_master_clock() {
+        assert_eq!(
+            stats_fingerprint(HEALTHY_A),
+            Some("A-V: -0.091 fd=   0 aq=    0KB vq=   29KB sq=    0B"),
+        );
+
+        assert_eq!(
+            stats_fingerprint(FROZEN_A),
+            stats_fingerprint(FROZEN_B),
+        );
+
+        assert_ne!(
+            stats_fingerprint(HEALTHY_A),
+            stats_fingerprint(HEALTHY_B),
+        );
+    }
+
+
+    #[test]
+    fn fingerprint_ignores_non_status_lines() {
+        assert_eq!(
+            stats_fingerprint(
+                "    nan A-V:    nan fd=   0 aq=    0KB vq=    0KB sq=    0B "
+            ),
+            None,
+        );
+
+        assert_eq!(
+            stats_fingerprint(
+                "  Stream #0:0: Video: h264, yuv420p, 1920x1080, 60 fps"
+            ),
+            None,
+        );
+
+        assert_eq!(stats_fingerprint(""), None);
+    }
+
+
+    #[test]
+    fn changing_status_is_progress() {
+        let start =
+            Instant::now();
+
+        let mut progress =
+            MediaProgress::new();
+
+        for step in 0..400_u64 {
+            let line =
+                if step % 2 == 0 {
+                    HEALTHY_A
+                } else {
+                    HEALTHY_B
+                };
+
+            let stalled_for =
+                progress.observe(
+                    stats_fingerprint(line).unwrap(),
+                    start + Duration::from_millis(step * 33),
+                );
+
+            assert_eq!(stalled_for, Duration::ZERO);
+        }
+    }
+
+
+    #[test]
+    fn frozen_status_reaches_threshold() {
+        let start =
+            Instant::now();
+
+        let mut progress =
+            MediaProgress::new();
+
+        progress.observe(
+            stats_fingerprint(HEALTHY_A).unwrap(),
+            start,
+        );
+
+        let mut stalled_at =
+            None;
+
+        // The master clock keeps advancing while the rest stays frozen.
+        for step in 1..400_u64 {
+            let line =
+                format!(
+                    "{:7.2} A-V: -0.074 fd=   0 aq=    0KB vq=    0KB sq=    0B ",
+                    9.0 + step as f64 * 0.033
+                );
+
+            let stalled_for =
+                progress.observe(
+                    stats_fingerprint(&line).unwrap(),
+                    start + Duration::from_millis(step * 33),
+                );
+
+            if stalled_for >= MEDIA_STALL_THRESHOLD {
+                stalled_at =
+                    Some(step * 33);
+
+                break;
+            }
+        }
+
+        // First frozen line arrives at 33ms, so the threshold is crossed
+        // roughly 5 seconds after that.
+        let stalled_at =
+            stalled_at.expect("stall should be detected");
+
+        assert!((5033..5100).contains(&stalled_at));
+    }
+
+
+    #[test]
+    fn progress_resets_stall_timer() {
+        let start =
+            Instant::now();
+
+        let mut progress =
+            MediaProgress::new();
+
+        progress.observe(
+            stats_fingerprint(FROZEN_A).unwrap(),
+            start,
+        );
+
+        assert_eq!(
+            progress.observe(
+                stats_fingerprint(FROZEN_B).unwrap(),
+                start + Duration::from_secs(4),
+            ),
+            Duration::from_secs(4),
+        );
+
+        assert_eq!(
+            progress.observe(
+                stats_fingerprint(HEALTHY_A).unwrap(),
+                start + Duration::from_secs(5),
+            ),
+            Duration::ZERO,
+        );
+
+        assert_eq!(
+            progress.observe(
+                stats_fingerprint(HEALTHY_A).unwrap(),
+                start + Duration::from_secs(6),
+            ),
+            Duration::from_secs(1),
+        );
+    }
 }

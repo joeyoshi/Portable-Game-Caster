@@ -203,11 +203,25 @@ fn discover_matching(
         }
 
 
+        let mut poll_slice =
+            Duration::from_millis(250);
+
+
         if started.elapsed() >= countdown_start {
+            // Wake at the next whole-second boundary so the visible countdown
+            // is not delayed by the polling slice below.
             let milliseconds =
                 timeout
                     .saturating_sub(started.elapsed())
                     .as_millis();
+
+
+            poll_slice =
+                poll_slice.min(
+                    Duration::from_millis(
+                        ((milliseconds + 999) % 1000 + 1) as u64
+                    )
+                );
 
 
             let seconds_remaining =
@@ -226,7 +240,7 @@ fn discover_matching(
 
 
         match receiver.recv_timeout(
-            Duration::from_millis(250)
+            poll_slice
         ) {
             // -----------------------------------------------------------------
             // A PGC service was announced.

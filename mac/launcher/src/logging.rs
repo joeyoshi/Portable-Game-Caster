@@ -8,6 +8,10 @@ use std::sync::atomic::{
     AtomicU8,
     Ordering,
 };
+use std::time::{
+    SystemTime,
+    UNIX_EPOCH,
+};
 
 use crate::state::AppState;
 
@@ -283,19 +287,85 @@ fn print_log(
             .is_terminal();
 
 
+    let timestamp =
+        utc_timestamp();
+
+
     if terminal {
         if is_trace {
             eprintln!(
-                "\x1b[90m[PGC][{category}]\x1b[0m {args}"
+                "\x1b[90m[{timestamp}][PGC][{category}]\x1b[0m {args}"
             );
         } else {
             eprintln!(
-                "\x1b[36m[PGC][{category}]\x1b[0m {args}"
+                "\x1b[36m[{timestamp}][PGC][{category}]\x1b[0m {args}"
             );
         }
     } else {
         eprintln!(
-            "[PGC][{category}] {args}"
+            "[{timestamp}][PGC][{category}] {args}"
+        );
+    }
+}
+
+
+// -----------------------------------------------------------------------------
+// UTC time of day with milliseconds
+//
+// Same format as the Windows Host diagnostics so Client and Host logs can be
+// lined up.
+// -----------------------------------------------------------------------------
+
+fn utc_timestamp() -> String {
+    let millis =
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(
+                |elapsed| {
+                    elapsed.as_millis()
+                }
+            )
+            .unwrap_or(0);
+
+
+    format_time_of_day(
+        millis
+    )
+}
+
+
+fn format_time_of_day(
+    unix_millis: u128,
+) -> String {
+    let millis_of_day =
+        unix_millis % 86_400_000;
+
+
+    format!(
+        "{:02}:{:02}:{:02}.{:03}Z",
+        millis_of_day / 3_600_000,
+        millis_of_day / 60_000 % 60,
+        millis_of_day / 1000 % 60,
+        millis_of_day % 1000,
+    )
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+
+    #[test]
+    fn formats_time_of_day() {
+        assert_eq!(
+            format_time_of_day(0),
+            "00:00:00.000Z"
+        );
+
+        assert_eq!(
+            format_time_of_day(86_400_000 + 3_723_045),
+            "01:02:03.045Z"
         );
     }
 }
