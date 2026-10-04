@@ -26,16 +26,25 @@ pub type SharedPlayer =
     Arc<Mutex<Option<Child>>>;
 
 
-const INITIAL_MEDIA_TIMEOUT:
+// -----------------------------------------------------------------------------
+// Connection policy
+// -----------------------------------------------------------------------------
+
+const MEDIA_WARMUP_TIMEOUT:
     Duration =
-        Duration::from_secs(10);
+        Duration::from_secs(15);
+
+
+const COLD_SERVICE_PROBE_TIMEOUT:
+    Duration =
+        Duration::from_millis(500);
 
 
 // -----------------------------------------------------------------------------
-// Player status
+// Player monitoring
 // -----------------------------------------------------------------------------
 
-pub(crate) enum PlayerPoll {
+enum PlayerPoll {
     Running,
 
     ExitedSuccessfully,
@@ -43,6 +52,29 @@ pub(crate) enum PlayerPoll {
     ExitedUnexpectedly,
 
     MonitorError,
+
+    Missing,
+}
+
+
+// -----------------------------------------------------------------------------
+// Media warm-up result
+// -----------------------------------------------------------------------------
+
+enum MediaWarmupResult {
+    Started {
+        receiver:
+            player::TransportReceiver,
+
+        info:
+            player::StreamInfo,
+    },
+
+    ServiceLost,
+
+    TimedOut,
+
+    UserClosed,
 
     Missing,
 }
@@ -62,10 +94,19 @@ pub fn run_stream_flow(
                 &state
             );
 
+
             let _ =
-                tx.send(state);
+                tx.send(
+                    state
+                );
         };
 
+
+    // -------------------------------------------------------------------------
+    // FRESH / COLD CONNECTION
+    //
+    // This path never emits Reconnecting states.
+    // -------------------------------------------------------------------------
 
     send(
         AppState::Discovering
@@ -78,12 +119,14 @@ pub fn run_stream_flow(
                 endpoint
             }
 
+
             Err(error) => {
                 send(
                     AppState::Error(
                         error.to_string()
                     )
                 );
+
 
                 return;
             }
@@ -130,6 +173,7 @@ pub fn run_stream_flow(
             )
         );
 
+
         return;
     }
 
@@ -137,7 +181,7 @@ pub fn run_stream_flow(
     logging::debug(
         "CONNECT",
         format_args!(
-            "RTSP service reachable"
+            "RTSP handshake established"
         ),
     );
 
@@ -149,165 +193,107 @@ pub fn run_stream_flow(
     );
 
 
-    let mut transport_rx =
-        match launch_player(
+    let (
+        mut transport_rx,
+        _initial_info,
+    ) =
+        match wait_for_media_with_retries(
             &endpoint,
             &player_handle,
+            MEDIA_WARMUP_TIMEOUT,
         ) {
-            Ok(receiver) => {
-                receiver
+            MediaWarmupResult::Started {
+                receiver,
+                info,
+            } => {
+                (
+                    receiver,
+                    info,
+                )
             }
 
-            Err(error) => {
+
+            MediaWarmupResult::TimedOut => {
                 send(
                     AppState::Error(
-                        error
+                        format!(
+                            "Connected to {host}, but the stream did not begin producing media within 15 seconds."
+                        )
                     )
                 );
 
+
+                return;
+            }
+
+
+            MediaWarmupResult::ServiceLost => {
+                // This was still a cold connection.
+                //
+                // Do NOT claim we are reconnecting because we never reached
+                // Playing in the first place.
+                send(
+                    AppState::Error(
+                        format!(
+                            "Connected to {host}, but the streaming service became unavailable before media started."
+                        )
+                    )
+                );
+
+
+                return;
+            }
+
+
+            MediaWarmupResult::UserClosed => {
+                send(
+                    AppState::Idle
+                );
+
+
+                return;
+            }
+
+
+            MediaWarmupResult::Missing => {
                 return;
             }
         };
 
 
-    logging::debug(
-        "HEALTH",
-        format_args!(
-            "Waiting for confirmed media flow"
-        ),
+    // Only now is "Connected" truthful.
+    send(
+        AppState::Playing(
+            host.clone()
+        )
     );
 
 
-    match wait_for_media_start(
-        &transport_rx,
-        &player_handle,
-        Instant::now()
-            + INITIAL_MEDIA_TIMEOUT,
-    ) {
-        MediaStartResult::Started => {
-            send(
-                AppState::Playing(
-                    host.clone()
-                )
-            );
-        }
-
-
-        MediaStartResult::ClosedNormally => {
-            clear_player(
-                &player_handle
-            );
-
-            send(
-                AppState::Idle
-            );
-
-            return;
-        }
-
-
-        MediaStartResult::Lost
-        | MediaStartResult::Exited
-        | MediaStartResult::MonitorError => {
-            terminate_player(
-                &player_handle
-            );
-
-
-            send(
-                AppState::ReconnectingStream {
-                    host:
-                        host.clone(),
-
-                    seconds_remaining:
-                        5,
-                }
-            );
-
-
-            match reconnect::attempt_reconnect(
-                &send,
-                &mut endpoint,
-                &player_handle,
-            ) {
-                reconnect::ReconnectResult::Recovered(
-                    receiver
-                ) => {
-                    transport_rx =
-                        receiver;
-                }
-
-
-                reconnect::ReconnectResult::Failed => {
-                    send(
-                        AppState::Idle
-                    );
-
-                    return;
-                }
-            }
-        }
-
-
-        MediaStartResult::TimedOut => {
-            logging::debug(
-                "HEALTH",
-                format_args!(
-                    "ffplay started but no media flow was confirmed within 10 seconds"
-                ),
-            );
-
-
-            terminate_player(
-                &player_handle
-            );
-
-
-            send(
-                AppState::Error(
-                    format!(
-                        "Connected to {host}, but the stream did not begin producing media."
-                    )
-                )
-            );
-
-
-            return;
-        }
-
-
-        MediaStartResult::Missing => {
-            return;
-        }
-    }
-
-
     // -------------------------------------------------------------------------
-    // Active playback lifecycle
+    // ACTIVE PLAYBACK
     // -------------------------------------------------------------------------
 
     loop {
         thread::sleep(
-            Duration::from_millis(100)
+            Duration::from_millis(
+                100
+            )
         );
 
 
         // ---------------------------------------------------------------------
-        // ffplay-derived transport/media events
+        // Transport event from ffplay
         // ---------------------------------------------------------------------
 
         match transport_rx.try_recv() {
             Ok(
                 player::TransportEvent::Lost
             ) => {
-                send(
-                    AppState::ReconnectingStream {
-                        host:
-                            endpoint.host.clone(),
-
-                        seconds_remaining:
-                            5,
-                    }
+                logging::debug(
+                    "HEALTH",
+                    format_args!(
+                        "Active stream transport lost"
+                    ),
                 );
 
 
@@ -316,26 +302,23 @@ pub fn run_stream_flow(
                 );
 
 
-                match reconnect::attempt_reconnect(
+                match recover_stream(
                     &send,
                     &mut endpoint,
                     &player_handle,
                 ) {
-                    reconnect::ReconnectResult::Recovered(
-                        receiver
+                    Some(
+                        new_receiver
                     ) => {
                         transport_rx =
-                            receiver;
+                            new_receiver;
+
 
                         continue;
                     }
 
 
-                    reconnect::ReconnectResult::Failed => {
-                        send(
-                            AppState::Idle
-                        );
-
+                    None => {
                         return;
                     }
                 }
@@ -343,10 +326,11 @@ pub fn run_stream_flow(
 
 
             Ok(
-                player::TransportEvent::MediaStarted
+                player::TransportEvent::MediaStarted(
+                    _
+                )
             ) => {
-                // This event belongs to a stream already marked Playing.
-                // No state change is needed.
+                // Already Playing.
             }
 
 
@@ -362,7 +346,7 @@ pub fn run_stream_flow(
 
 
         // ---------------------------------------------------------------------
-        // Child-process lifecycle
+        // ffplay lifecycle
         // ---------------------------------------------------------------------
 
         match poll_player(
@@ -371,6 +355,7 @@ pub fn run_stream_flow(
             PlayerPoll::Running => {}
 
 
+            // Manual close of the player window is intentional.
             PlayerPoll::ExitedSuccessfully => {
                 logging::debug(
                     "PLAYER",
@@ -399,19 +384,8 @@ pub fn run_stream_flow(
                 logging::debug(
                     "PLAYER",
                     format_args!(
-                        "ffplay ended unexpectedly"
+                        "ffplay exited unexpectedly during active playback"
                     ),
-                );
-
-
-                send(
-                    AppState::ReconnectingStream {
-                        host:
-                            endpoint.host.clone(),
-
-                        seconds_remaining:
-                            5,
-                    }
                 );
 
 
@@ -420,26 +394,23 @@ pub fn run_stream_flow(
                 );
 
 
-                match reconnect::attempt_reconnect(
+                match recover_stream(
                     &send,
                     &mut endpoint,
                     &player_handle,
                 ) {
-                    reconnect::ReconnectResult::Recovered(
-                        receiver
+                    Some(
+                        new_receiver
                     ) => {
                         transport_rx =
-                            receiver;
+                            new_receiver;
+
 
                         continue;
                     }
 
 
-                    reconnect::ReconnectResult::Failed => {
-                        send(
-                            AppState::Idle
-                        );
-
+                    None => {
                         return;
                     }
                 }
@@ -447,6 +418,7 @@ pub fn run_stream_flow(
 
 
             PlayerPoll::Missing => {
+                // Usually AppKit deliberately terminated it during Quit.
                 return;
             }
         }
@@ -455,110 +427,424 @@ pub fn run_stream_flow(
 
 
 // -----------------------------------------------------------------------------
-// Media-start result
+// Recover a stream that was PREVIOUSLY Playing.
+//
+// This is the only path that is allowed to emit Reconnecting states.
 // -----------------------------------------------------------------------------
 
-pub(crate) enum MediaStartResult {
-    Started,
-
-    Lost,
-
-    ClosedNormally,
-
-    Exited,
-
-    MonitorError,
-
-    Missing,
-
-    TimedOut,
-}
-
-
-// -----------------------------------------------------------------------------
-// Wait until actual decoded media begins
-// -----------------------------------------------------------------------------
-
-pub(crate) fn wait_for_media_start(
-    transport_rx: &Receiver<
-        player::TransportEvent
-    >,
+fn recover_stream<F>(
+    send: &F,
+    endpoint: &mut discovery::StreamEndpoint,
     player_handle: &SharedPlayer,
-    deadline: Instant,
-) -> MediaStartResult {
+) -> Option<
+    player::TransportReceiver
+>
+where
+    F: Fn(AppState),
+{
+    let host =
+        endpoint.host.clone();
+
+
     loop {
-        if Instant::now()
-            >= deadline
-        {
-            return MediaStartResult::TimedOut;
-        }
+        // ---------------------------------------------------------------------
+        // Stage 1:
+        //
+        // Restore host / RTSP handshake.
+        // ---------------------------------------------------------------------
 
+        send(
+            AppState::ReconnectingStream {
+                host:
+                    host.clone(),
 
-        match transport_rx.try_recv() {
-            Ok(
-                player::TransportEvent::MediaStarted
-            ) => {
-                return MediaStartResult::Started;
+                seconds_remaining:
+                    15,
             }
-
-
-            Ok(
-                player::TransportEvent::Lost
-            ) => {
-                return MediaStartResult::Lost;
-            }
-
-
-            Err(
-                TryRecvError::Empty
-            ) => {}
-
-
-            Err(
-                TryRecvError::Disconnected
-            ) => {}
-        }
-
-
-        match poll_player(
-            player_handle
-        ) {
-            PlayerPoll::Running => {}
-
-
-            PlayerPoll::ExitedSuccessfully => {
-                return MediaStartResult::ClosedNormally;
-            }
-
-
-            PlayerPoll::ExitedUnexpectedly => {
-                return MediaStartResult::Exited;
-            }
-
-
-            PlayerPoll::MonitorError => {
-                return MediaStartResult::MonitorError;
-            }
-
-
-            PlayerPoll::Missing => {
-                return MediaStartResult::Missing;
-            }
-        }
-
-
-        thread::sleep(
-            Duration::from_millis(100)
         );
+
+
+        match reconnect::restore_handshake(
+            send,
+            endpoint,
+        ) {
+            reconnect::ReconnectResult::HandshakeRestored => {}
+
+
+            reconnect::ReconnectResult::Failed => {
+                logging::debug(
+                    "RECONNECT",
+                    format_args!(
+                        "Unable to restore connection to {host}"
+                    ),
+                );
+
+
+                send(
+                    AppState::Idle
+                );
+
+
+                return None;
+            }
+        }
+
+
+        // ---------------------------------------------------------------------
+        // Stage 2:
+        //
+        // Handshake is back.
+        //
+        // We are no longer reconnecting. Now we are simply waiting for actual
+        // media to warm up.
+        // ---------------------------------------------------------------------
+
+        logging::debug(
+            "RECONNECT",
+            format_args!(
+                "Handshake restored; waiting for media"
+            ),
+        );
+
+
+        send(
+            AppState::WaitingForStream(
+                host.clone()
+            )
+        );
+
+
+        match wait_for_media_with_retries(
+            endpoint,
+            player_handle,
+            MEDIA_WARMUP_TIMEOUT,
+        ) {
+            MediaWarmupResult::Started {
+                receiver,
+                info: _,
+            } => {
+                logging::debug(
+                    "RECONNECT",
+                    format_args!(
+                        "Stream recovery complete"
+                    ),
+                );
+
+
+                send(
+                    AppState::Playing(
+                        host.clone()
+                    )
+                );
+
+
+                return Some(
+                    receiver
+                );
+            }
+
+
+            // RTSP disappeared again while warming up.
+            //
+            // Go back to Stage 1.
+            MediaWarmupResult::ServiceLost => {
+                logging::debug(
+                    "RECONNECT",
+                    format_args!(
+                        "RTSP service was lost again during media warm-up"
+                    ),
+                );
+
+
+                continue;
+            }
+
+
+            MediaWarmupResult::TimedOut => {
+                logging::debug(
+                    "HEALTH",
+                    format_args!(
+                        "Handshake was restored, but media never resumed"
+                    ),
+                );
+
+
+                send(
+                    AppState::Error(
+                        format!(
+                            "Connection to {host} was restored, but the stream did not begin producing media within 15 seconds."
+                        )
+                    )
+                );
+
+
+                return None;
+            }
+
+
+            MediaWarmupResult::UserClosed => {
+                send(
+                    AppState::Idle
+                );
+
+
+                return None;
+            }
+
+
+            MediaWarmupResult::Missing => {
+                return None;
+            }
+        }
     }
 }
 
 
 // -----------------------------------------------------------------------------
-// Launch player
+// Wait for actual media.
+//
+// During this phase the UI should already be WaitingForStream.
+//
+// If ffplay dies while RTSP remains available, we can quietly relaunch it
+// without pretending the connection itself was lost.
+//
+// This is especially useful while runOnDemand / FFmpeg are warming up.
 // -----------------------------------------------------------------------------
 
-pub(crate) fn launch_player(
+fn wait_for_media_with_retries(
+    endpoint: &discovery::StreamEndpoint,
+    player_handle: &SharedPlayer,
+    timeout: Duration,
+) -> MediaWarmupResult {
+    let deadline =
+        Instant::now()
+            + timeout;
+
+
+    logging::debug(
+        "HEALTH",
+        format_args!(
+            "Waiting up to {} seconds for confirmed media flow",
+            timeout.as_secs()
+        ),
+    );
+
+
+    while Instant::now()
+        < deadline
+    {
+        // ---------------------------------------------------------------------
+        // Is RTSP still reachable?
+        // ---------------------------------------------------------------------
+
+        if player::check_stream_service_timeout(
+            &endpoint.address,
+            endpoint.port,
+            COLD_SERVICE_PROBE_TIMEOUT,
+        )
+        .is_err()
+        {
+            terminate_player(
+                player_handle
+            );
+
+
+            return MediaWarmupResult::ServiceLost;
+        }
+
+
+        // ---------------------------------------------------------------------
+        // Launch a player attempt
+        // ---------------------------------------------------------------------
+
+        let receiver =
+            match launch_player(
+                endpoint,
+                player_handle,
+            ) {
+                Ok(receiver) => {
+                    receiver
+                }
+
+
+                Err(error) => {
+                    logging::debug(
+                        "PLAYER",
+                        format_args!(
+                            "ffplay launch attempt failed: {error}"
+                        ),
+                    );
+
+
+                    thread::sleep(
+                        Duration::from_millis(
+                            250
+                        )
+                    );
+
+
+                    continue;
+                }
+            };
+
+
+        // ---------------------------------------------------------------------
+        // Monitor this attempt until:
+        //
+        // - media starts
+        // - transport dies
+        // - ffplay exits
+        // - overall warm-up deadline expires
+        // ---------------------------------------------------------------------
+
+        loop {
+            if Instant::now()
+                >= deadline
+            {
+                terminate_player(
+                    player_handle
+                );
+
+
+                return MediaWarmupResult::TimedOut;
+            }
+
+
+            match receiver.try_recv() {
+                Ok(
+                    player::TransportEvent::MediaStarted(
+                        info
+                    )
+                ) => {
+                    return MediaWarmupResult::Started {
+                        receiver,
+                        info,
+                    };
+                }
+
+
+                Ok(
+                    player::TransportEvent::Lost
+                ) => {
+                    terminate_player(
+                        player_handle
+                    );
+
+
+                    // If MediaMTX itself vanished, this is a real handshake
+                    // loss. Otherwise the server is still there and the
+                    // source/player is simply not ready yet.
+                    if player::check_stream_service_timeout(
+                        &endpoint.address,
+                        endpoint.port,
+                        COLD_SERVICE_PROBE_TIMEOUT,
+                    )
+                    .is_err()
+                    {
+                        return MediaWarmupResult::ServiceLost;
+                    }
+
+
+                    logging::debug(
+                        "HEALTH",
+                        format_args!(
+                            "Player lost RTSP during warm-up; service remains reachable, retrying"
+                        ),
+                    );
+
+
+                    break;
+                }
+
+
+                Err(
+                    TryRecvError::Empty
+                ) => {}
+
+
+                Err(
+                    TryRecvError::Disconnected
+                ) => {}
+            }
+
+
+            match poll_player(
+                player_handle
+            ) {
+                PlayerPoll::Running => {}
+
+
+                PlayerPoll::ExitedSuccessfully => {
+                    clear_player(
+                        player_handle
+                    );
+
+
+                    return MediaWarmupResult::UserClosed;
+                }
+
+
+                PlayerPoll::ExitedUnexpectedly
+                | PlayerPoll::MonitorError => {
+                    clear_player(
+                        player_handle
+                    );
+
+
+                    if player::check_stream_service_timeout(
+                        &endpoint.address,
+                        endpoint.port,
+                        COLD_SERVICE_PROBE_TIMEOUT,
+                    )
+                    .is_err()
+                    {
+                        return MediaWarmupResult::ServiceLost;
+                    }
+
+
+                    logging::debug(
+                        "HEALTH",
+                        format_args!(
+                            "Player exited before media began; RTSP remains reachable, retrying"
+                        ),
+                    );
+
+
+                    break;
+                }
+
+
+                PlayerPoll::Missing => {
+                    return MediaWarmupResult::Missing;
+                }
+            }
+
+
+            thread::sleep(
+                Duration::from_millis(
+                    100
+                )
+            );
+        }
+
+
+        thread::sleep(
+            Duration::from_millis(
+                250
+            )
+        );
+    }
+
+
+    MediaWarmupResult::TimedOut
+}
+
+
+// -----------------------------------------------------------------------------
+// Launch ffplay
+// -----------------------------------------------------------------------------
+
+fn launch_player(
     endpoint: &discovery::StreamEndpoint,
     player_handle: &SharedPlayer,
 ) -> Result<
@@ -598,10 +884,10 @@ pub(crate) fn launch_player(
 
 
 // -----------------------------------------------------------------------------
-// Poll player
+// Poll ffplay
 // -----------------------------------------------------------------------------
 
-pub(crate) fn poll_player(
+fn poll_player(
     player_handle: &SharedPlayer,
 ) -> PlayerPoll {
     let mut slot =
@@ -645,10 +931,10 @@ pub(crate) fn poll_player(
 
 
 // -----------------------------------------------------------------------------
-// Kill stale player
+// Kill stale ffplay
 // -----------------------------------------------------------------------------
 
-pub(crate) fn terminate_player(
+fn terminate_player(
     player_handle: &SharedPlayer,
 ) {
     let mut slot =
@@ -686,10 +972,10 @@ pub(crate) fn terminate_player(
 
 
 // -----------------------------------------------------------------------------
-// Clear finished player
+// Clear completed ffplay
 // -----------------------------------------------------------------------------
 
-pub(crate) fn clear_player(
+fn clear_player(
     player_handle: &SharedPlayer,
 ) {
     let mut slot =

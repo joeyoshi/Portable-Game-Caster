@@ -1,6 +1,3 @@
-use std::sync::mpsc::{
-    TryRecvError,
-};
 use std::thread;
 use std::time::{
     Duration,
@@ -12,51 +9,51 @@ use crate::logging;
 use crate::player;
 use crate::state::AppState;
 
-use super::{
-    clear_player,
-    launch_player,
-    poll_player,
-    terminate_player,
-    PlayerPoll,
-    SharedPlayer,
-};
-
 
 // -----------------------------------------------------------------------------
 // Reconnect policy
 // -----------------------------------------------------------------------------
 
-const RECONNECT_DURATION:
+const RECONNECT_TIMEOUT:
     Duration =
-        Duration::from_secs(5);
+        Duration::from_secs(15);
 
 
-const FAST_SERVICE_TIMEOUT:
+const SERVICE_PROBE_TIMEOUT:
     Duration =
         Duration::from_millis(300);
 
 
 // -----------------------------------------------------------------------------
-// Reconnect result
+// Result
 // -----------------------------------------------------------------------------
 
 pub enum ReconnectResult {
-    Recovered(
-        player::TransportReceiver
-    ),
+    HandshakeRestored,
 
     Failed,
 }
 
 
 // -----------------------------------------------------------------------------
-// Attempt recovery of the SAME host
+// Restore the same host / RTSP service
+//
+// IMPORTANT:
+//
+// Reconnecting means:
+//
+//     "I have lost the connection and am trying to restore the host/service."
+//
+// Once RTSP is reachable again, this function returns immediately.
+//
+// Media warm-up is handled separately by worker/mod.rs while the UI displays:
+//
+//     Waiting for Stream
 // -----------------------------------------------------------------------------
 
-pub fn attempt_reconnect<F>(
+pub fn restore_handshake<F>(
     send: &F,
     endpoint: &mut discovery::StreamEndpoint,
-    player_handle: &SharedPlayer,
 ) -> ReconnectResult
 where
     F: Fn(AppState),
@@ -67,177 +64,134 @@ where
 
     let deadline =
         Instant::now()
-            + RECONNECT_DURATION;
+            + RECONNECT_TIMEOUT;
 
 
     logging::debug(
         "RECONNECT",
         format_args!(
-            "Starting 5-second recovery window for {host}"
+            "Starting 15-second handshake recovery window for {host}"
         ),
     );
+
+
+    let mut last_state:
+        Option<(
+            bool,
+            u8,
+        )> =
+            None;
 
 
     while Instant::now()
         < deadline
     {
-        let remaining =
+        let seconds =
             seconds_remaining(
                 deadline
             );
 
 
         // ---------------------------------------------------------------------
-        // Is RTSP already back?
+        // First try the last-known address.
         // ---------------------------------------------------------------------
 
         if player::check_stream_service_timeout(
             &endpoint.address,
             endpoint.port,
-            FAST_SERVICE_TIMEOUT,
+            SERVICE_PROBE_TIMEOUT,
         )
         .is_ok()
         {
-            send(
-                AppState::ReconnectingStream {
-                    host:
-                        host.clone(),
-
-                    seconds_remaining:
-                        remaining,
-                }
-            );
-
-
             logging::debug(
                 "RECONNECT",
                 format_args!(
-                    "RTSP service reachable; launching replacement player"
+                    "RTSP handshake restored at {}:{}",
+                    endpoint.address,
+                    endpoint.port
                 ),
             );
 
 
-            if let Some(receiver) =
-                try_restart_player(
-                    send,
-                    endpoint,
-                    player_handle,
-                    deadline,
+            return ReconnectResult::HandshakeRestored;
+        }
+
+
+        // ---------------------------------------------------------------------
+        // RTSP is unavailable.
+        //
+        // Determine whether the same host can still be found through mDNS.
+        // ---------------------------------------------------------------------
+
+        match discovery::discover_host(
+            &host,
+            Duration::from_millis(
+                300
+            ),
+        ) {
+            Ok(
+                Some(
+                    updated_endpoint
                 )
-            {
-                logging::debug(
+            ) => {
+                *endpoint =
+                    updated_endpoint;
+
+
+                emit_reconnect_state(
+                    send,
+                    &host,
+                    false,
+                    seconds,
+                    &mut last_state,
+                );
+
+
+                logging::trace(
                     "RECONNECT",
                     format_args!(
-                        "Media recovery successful"
+                        "Host present at {}; RTSP not ready yet",
+                        endpoint.address
                     ),
                 );
+            }
 
 
-                send(
-                    AppState::Playing(
-                        host.clone()
-                    )
-                );
-
-
-                return ReconnectResult::Recovered(
-                    receiver
+            Ok(None) => {
+                emit_reconnect_state(
+                    send,
+                    &host,
+                    true,
+                    seconds,
+                    &mut last_state,
                 );
             }
-        } else {
-            // -----------------------------------------------------------------
-            // RTSP unavailable. Check whether this same PGC host is still
-            // advertised.
-            // -----------------------------------------------------------------
-
-            logging::trace(
-                "RECONNECT",
-                format_args!(
-                    "RTSP unavailable; rediscovering {host}"
-                ),
-            );
 
 
-            match discovery::discover_host(
-                &host,
-                Duration::from_millis(300),
-            ) {
-                Ok(
-                    Some(
-                        updated_endpoint
-                    )
-                ) => {
-                    *endpoint =
-                        updated_endpoint;
+            Err(error) => {
+                emit_reconnect_state(
+                    send,
+                    &host,
+                    true,
+                    seconds,
+                    &mut last_state,
+                );
 
 
-                    send(
-                        AppState::ReconnectingStream {
-                            host:
-                                host.clone(),
-
-                            seconds_remaining:
-                                remaining,
-                        }
-                    );
-
-
-                    logging::debug(
-                        "RECONNECT",
-                        format_args!(
-                            "Host rediscovered at {} but stream is not ready",
-                            endpoint.address
-                        ),
-                    );
-                }
-
-
-                Ok(None) => {
-                    send(
-                        AppState::ReconnectingHost {
-                            host:
-                                host.clone(),
-
-                            seconds_remaining:
-                                remaining,
-                        }
-                    );
-
-
-                    logging::debug(
-                        "RECONNECT",
-                        format_args!(
-                            "Host is not currently discoverable"
-                        ),
-                    );
-                }
-
-
-                Err(error) => {
-                    send(
-                        AppState::ReconnectingHost {
-                            host:
-                                host.clone(),
-
-                            seconds_remaining:
-                                remaining,
-                        }
-                    );
-
-
-                    logging::trace(
-                        "RECONNECT",
-                        format_args!(
-                            "Rediscovery error: {error}"
-                        ),
-                    );
-                }
+                logging::trace(
+                    "RECONNECT",
+                    format_args!(
+                        "Targeted rediscovery failed: {error}"
+                    ),
+                );
             }
         }
 
 
         thread::sleep(
-            Duration::from_millis(100)
+            Duration::from_millis(
+                100
+            )
         );
     }
 
@@ -245,7 +199,7 @@ where
     logging::debug(
         "RECONNECT",
         format_args!(
-            "Recovery deadline expired"
+            "Handshake recovery deadline expired"
         ),
     );
 
@@ -255,162 +209,70 @@ where
 
 
 // -----------------------------------------------------------------------------
-// Start a replacement ffplay and REQUIRE actual media before recovery succeeds.
+// Avoid spamming identical state updates/log entries 10 times per second.
 // -----------------------------------------------------------------------------
 
-fn try_restart_player<F>(
+fn emit_reconnect_state<F>(
     send: &F,
-    endpoint: &discovery::StreamEndpoint,
-    player_handle: &SharedPlayer,
-    deadline: Instant,
-) -> Option<
-    player::TransportReceiver
->
+    host: &str,
+    host_missing: bool,
+    seconds: u8,
+    last_state: &mut Option<(
+        bool,
+        u8,
+    )>,
+)
 where
     F: Fn(AppState),
 {
-    clear_player(
-        player_handle
-    );
-
-
-    let receiver =
-        match launch_player(
-            endpoint,
-            player_handle,
-        ) {
-            Ok(receiver) => {
-                receiver
-            }
-
-
-            Err(error) => {
-                logging::debug(
-                    "RECONNECT",
-                    format_args!(
-                        "Replacement ffplay failed to launch: {error}"
-                    ),
-                );
-
-
-                return None;
-            }
-        };
-
-
-    logging::debug(
-        "RECONNECT",
-        format_args!(
-            "Replacement player launched; waiting for media"
-        ),
-    );
-
-
-    loop {
-        if Instant::now()
-            >= deadline
-        {
-            terminate_player(
-                player_handle
-            );
-
-
-            return None;
-        }
-
-
-        let remaining =
-            seconds_remaining(
-                deadline
-            );
-
-
-        send(
-            AppState::ReconnectingStream {
-                host:
-                    endpoint.host.clone(),
-
-                seconds_remaining:
-                    remaining,
-            }
+    let state_key =
+        (
+            host_missing,
+            seconds,
         );
 
 
-        match receiver.try_recv() {
-            Ok(
-                player::TransportEvent::MediaStarted
-            ) => {
-                return Some(
-                    receiver
-                );
+    if *last_state
+        == Some(
+            state_key
+        )
+    {
+        return;
+    }
+
+
+    *last_state =
+        Some(
+            state_key
+        );
+
+
+    if host_missing {
+        send(
+            AppState::ReconnectingHost {
+                host:
+                    host.to_string(),
+
+                seconds_remaining:
+                    seconds,
             }
+        );
+    } else {
+        send(
+            AppState::ReconnectingStream {
+                host:
+                    host.to_string(),
 
-
-            Ok(
-                player::TransportEvent::Lost
-            ) => {
-                logging::debug(
-                    "RECONNECT",
-                    format_args!(
-                        "Replacement RTSP session failed before media began"
-                    ),
-                );
-
-
-                terminate_player(
-                    player_handle
-                );
-
-
-                return None;
+                seconds_remaining:
+                    seconds,
             }
-
-
-            Err(
-                TryRecvError::Empty
-            ) => {}
-
-
-            Err(
-                TryRecvError::Disconnected
-            ) => {}
-        }
-
-
-        match poll_player(
-            player_handle
-        ) {
-            PlayerPoll::Running => {}
-
-
-            PlayerPoll::ExitedSuccessfully
-            | PlayerPoll::ExitedUnexpectedly
-            | PlayerPoll::MonitorError
-            | PlayerPoll::Missing => {
-                clear_player(
-                    player_handle
-                );
-
-
-                return None;
-            }
-        }
-
-
-        thread::sleep(
-            Duration::from_millis(100)
         );
     }
 }
 
 
 // -----------------------------------------------------------------------------
-// Human-readable countdown
-//
-// Ceiling division means:
-// 4.1 sec → 5
-// 3.8 sec → 4
-// ...
+// Human-readable ceiling countdown
 // -----------------------------------------------------------------------------
 
 fn seconds_remaining(
@@ -442,6 +304,6 @@ fn seconds_remaining(
 
 
     seconds
-        .min(5)
+        .min(15)
         as u8
 }
