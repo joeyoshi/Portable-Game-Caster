@@ -49,6 +49,7 @@ use objc2_foundation::{
     NSTimer,
 };
 
+use crate::logging;
 use crate::worker;
 use crate::state::AppState;
 
@@ -118,12 +119,9 @@ define_class!(
             &self,
             _notification: &NSNotification,
         ) {
-            self.terminate_player();
+            logging::action("Quit (window closed)");
 
-            let app =
-                NSApplication::sharedApplication(self.mtm());
-
-            app.terminate(None);
+            self.quit_application();
         }
     }
 
@@ -169,6 +167,8 @@ define_class!(
                 return;
             }
 
+            logging::action("Retry");
+
             self.start_worker();
         }
 
@@ -179,8 +179,21 @@ define_class!(
             _sender: &AnyObject,
         ) {
             match self.ivars().primary_action.get() {
-                PrimaryAction::Retry => self.start_worker(),
-                PrimaryAction::Cancel | PrimaryAction::Stop => {
+                PrimaryAction::Retry => {
+                    logging::action("Retry");
+
+                    self.start_worker();
+                }
+
+                PrimaryAction::Cancel => {
+                    logging::action("Cancel");
+
+                    self.cancel_active_session();
+                }
+
+                PrimaryAction::Stop => {
+                    logging::action("Stop Stream");
+
                     self.cancel_active_session();
                 }
             }
@@ -200,6 +213,8 @@ define_class!(
                 return;
             }
 
+            logging::action("Search");
+
             self.start_worker();
         }
 
@@ -213,12 +228,9 @@ define_class!(
             &self,
             _sender: &AnyObject,
         ) {
-            self.terminate_player();
+            logging::action("Quit");
 
-            let app =
-                NSApplication::sharedApplication(self.mtm());
-
-            app.terminate(None);
+            self.quit_application();
         }
     }
 );
@@ -695,7 +707,48 @@ impl AppDelegate {
             .set(false);
 
 
+        // The cancelled worker can no longer report states, so the UI's
+        // return to Idle is logged here. The log must end where the UI does.
+        logging::state(&AppState::Idle);
+
         self.render_state(&AppState::Idle);
+    }
+
+
+    // -------------------------------------------------------------------------
+    // Quit: stop the session, terminate ffplay, exit
+    // -------------------------------------------------------------------------
+
+    fn quit_application(&self) {
+        // Stop the worker from reporting or starting anything further.
+        if let Some(cancellation) = self
+            .ivars()
+            .cancellation
+            .borrow()
+            .as_ref()
+        {
+            cancellation.store(
+                true,
+                Ordering::Relaxed,
+            );
+        }
+
+
+        self.terminate_player();
+
+
+        logging::info(
+            "APP",
+            format_args!(
+                "Portable Game Caster Client exiting."
+            ),
+        );
+
+
+        let app =
+            NSApplication::sharedApplication(self.mtm());
+
+        app.terminate(None);
     }
 
 
@@ -714,6 +767,14 @@ impl AppDelegate {
 
 
         if let Some(child) = slot.as_mut() {
+            logging::debug(
+                "PLAYER",
+                format_args!(
+                    "Terminating ffplay PID {}",
+                    child.id()
+                ),
+            );
+
             let _ = child.kill();
             let _ = child.wait();
         }

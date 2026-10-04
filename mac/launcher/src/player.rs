@@ -3,7 +3,6 @@ use std::error::Error;
 use std::io::{
     ErrorKind,
     Read,
-    Write,
 };
 use std::net::{
     SocketAddr,
@@ -217,7 +216,7 @@ pub fn check_stream_service_timeout(
         .parse::<SocketAddr>()?;
 
 
-    logging::trace(
+    logging::verbose(
         "PLAYER",
         format_args!(
             "Probing RTSP service at {socket_address} ({timeout:?})"
@@ -280,16 +279,6 @@ pub fn launch_ffplay(
         Command::new(
             &ffplay
         );
-
-
-    // Only force ANSI colour when we're actually going to display ffplay's
-    // raw output.
-    if logging::trace_enabled() {
-        command.env(
-            "AV_LOG_FORCE_COLOR",
-            "1",
-        );
-    }
 
 
     let mut child =
@@ -370,8 +359,10 @@ pub fn launch_ffplay(
                     "Failed reading RTSP data";
 
 
-            let mut terminal =
-                std::io::stderr();
+            // Verbose-only raw output: ffplay's in-place status line is
+            // emitted as ordinary lines, a few per interval at most.
+            let mut progress_throttle =
+                logging::ProgressThrottle::new();
 
 
             let mut read_buffer =
@@ -427,7 +418,7 @@ pub fn launch_ffplay(
 
 
                         Err(error) => {
-                            logging::trace(
+                            logging::verbose(
                                 "PLAYER",
                                 format_args!(
                                     "ffplay stderr monitor ended: {error}"
@@ -441,22 +432,6 @@ pub fn launch_ffplay(
 
                 let chunk =
                     &read_buffer[..bytes_read];
-
-
-                // ---------------------------------------------------------
-                // Raw ffplay firehose only in verbose mode
-                // ---------------------------------------------------------
-
-                if logging::trace_enabled() {
-                    let _ =
-                        terminal.write_all(
-                            chunk
-                        );
-
-
-                    let _ =
-                        terminal.flush();
-                }
 
 
                 // ---------------------------------------------------------
@@ -478,6 +453,11 @@ pub fn launch_ffplay(
                             }
                         )
                 {
+                    // A bare carriage return ends an in-place status update.
+                    let is_progress =
+                        parse_buffer[separator] == b'\r';
+
+
                     let segment =
                         parse_buffer
                             .drain(
@@ -506,6 +486,25 @@ pub fn launch_ffplay(
                         strip_ansi(
                             &raw_text
                         );
+
+
+                    // ---------------------------------------------------------
+                    // Raw ffplay output, Verbose only, labelled with its source
+                    // ---------------------------------------------------------
+
+                    if logging::verbose_enabled()
+                        && (
+                            !is_progress
+                                || progress_throttle.allow(
+                                    Instant::now()
+                                )
+                        )
+                    {
+                        logging::raw(
+                            logging::Source::Ffplay,
+                            text.trim_end(),
+                        );
+                    }
 
 
                     inspect_stream_metadata(
@@ -645,7 +644,7 @@ pub fn launch_ffplay(
             }
 
 
-            logging::trace(
+            logging::verbose(
                 "PLAYER",
                 format_args!(
                     "ffplay stderr monitor stopped"
@@ -1206,7 +1205,7 @@ fn find_ffplay(
 
 
         if path.exists() {
-            logging::trace(
+            logging::verbose(
                 "PLAYER",
                 format_args!(
                     "Using PGC_FFPLAY_PATH override"
@@ -1253,7 +1252,7 @@ fn find_ffplay(
         }
 
 
-        logging::trace(
+        logging::verbose(
             "PLAYER",
             format_args!(
                 "Checking Homebrew: {}",

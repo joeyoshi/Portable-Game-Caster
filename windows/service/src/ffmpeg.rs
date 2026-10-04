@@ -185,7 +185,7 @@ impl Encoder {
     // Demand went from present to absent.
     pub fn demand_ended(&mut self) {
         if self.running.is_some() {
-            logging::host(format_args!(
+            logging::debug("ENCODER", format_args!(
                 "FFmpeg will be stopped in {}s unless demand returns.",
                 DEMAND_END_GRACE.as_secs()
             ));
@@ -202,7 +202,7 @@ impl Encoder {
             if !running.publishing {
                 running.publishing = true;
 
-                logging::host(format_args!(
+                logging::info("ENCODER", format_args!(
                     "FFmpeg PID {} is publishing to MediaMTX ({:.1}s after launch).",
                     running.child.id(),
                     running.started.elapsed().as_secs_f64()
@@ -266,7 +266,7 @@ impl Encoder {
         let ran_for =
             running.started.elapsed();
 
-        logging::host(format_args!(
+        logging::warn("ENCODER", format_args!(
             "FFmpeg PID {} exited unexpectedly after {:.1}s: {status}.",
             running.child.id(),
             ran_for.as_secs_f64()
@@ -277,6 +277,12 @@ impl Encoder {
 
         if ran_for >= HEALTHY_RUN {
             self.failed_starts = 0;
+        } else {
+            logging::debug("ENCODER", format_args!(
+                "FFmpeg ran for less than {}s; counting it as a failed start ({} so far) for restart back-off.",
+                HEALTHY_RUN.as_secs(),
+                self.failed_starts + 1
+            ));
         }
 
         let delay =
@@ -289,13 +295,13 @@ impl Encoder {
 
 
         if demand_active {
-            logging::host(format_args!(
+            logging::info("ENCODER", format_args!(
                 "Demand is still active; restarting FFmpeg in {}s (attempt {}).",
                 delay.as_secs(),
                 self.failed_starts
             ));
         } else {
-            logging::host(format_args!(
+            logging::debug("ENCODER", format_args!(
                 "No demand; FFmpeg will not be restarted."
             ));
         }
@@ -303,7 +309,7 @@ impl Encoder {
 
 
     fn start(&mut self, job: &ChildJob) {
-        logging::host(format_args!(
+        logging::debug("ENCODER", format_args!(
             "FFmpeg launch requested: {}",
             self.executable.display()
         ));
@@ -324,8 +330,8 @@ impl Encoder {
                     let delay =
                         RESTART_DELAYS[RESTART_DELAYS.len() - 1];
 
-                    logging::host(format_args!(
-                        "FFmpeg launch FAILED: {error}. Retrying in {}s while demand remains.",
+                    logging::error("ENCODER", format_args!(
+                        "FFmpeg launch failed: {error}. Retrying in {}s while demand remains.",
                         delay.as_secs()
                     ));
 
@@ -339,10 +345,10 @@ impl Encoder {
         job.assign(&child, "FFmpeg");
 
         if let Some(stderr) = child.stderr.take() {
-            logging::relay_output(stderr, true, "FFMPEG", |_| {});
+            logging::relay_output(stderr, logging::Source::Ffmpeg, |_| {});
         }
 
-        logging::host(format_args!(
+        logging::info("ENCODER", format_args!(
             "FFmpeg launched (PID {}).",
             child.id()
         ));
@@ -369,44 +375,54 @@ impl Encoder {
         let pid =
             running.child.id();
 
-        logging::host(format_args!(
+        logging::info("ENCODER", format_args!(
             "Stopping FFmpeg PID {pid} ({reason})."
         ));
 
 
         if graceful {
+            logging::debug("ENCODER", format_args!(
+                "Asking FFmpeg PID {pid} to quit so it releases the capture device and encoder cleanly (up to {}s).",
+                QUIT_TIMEOUT.as_secs()
+            ));
+
             if let Some(mut stdin) = running.stdin.take() {
                 let _ = stdin.write_all(b"q");
                 let _ = stdin.flush();
             }
 
             if let Some(status) = wait_for_exit(&mut running.child, QUIT_TIMEOUT) {
-                logging::host(format_args!(
+                logging::info("ENCODER", format_args!(
                     "FFmpeg PID {pid} confirmed stopped after quit request: {status}."
                 ));
 
                 return;
             }
 
-            logging::host(format_args!(
+            logging::debug("ENCODER", format_args!(
                 "FFmpeg PID {pid} did not quit within {}s; terminating it.",
                 QUIT_TIMEOUT.as_secs()
             ));
         }
 
 
+        logging::debug("ENCODER", format_args!(
+            "Terminating FFmpeg PID {pid} and waiting up to {}s for confirmation.",
+            KILL_CONFIRM_TIMEOUT.as_secs()
+        ));
+
         let _ = running.child.kill();
 
         match wait_for_exit(&mut running.child, KILL_CONFIRM_TIMEOUT) {
             Some(status) => {
-                logging::host(format_args!(
+                logging::info("ENCODER", format_args!(
                     "FFmpeg PID {pid} confirmed stopped after termination: {status}."
                 ));
             }
 
             None => {
-                logging::host(format_args!(
-                    "WARNING: FFmpeg PID {pid} is still running {}s after termination was requested. No new FFmpeg will be started until it exits.",
+                logging::warn("ENCODER", format_args!(
+                    "FFmpeg PID {pid} is still running {}s after termination was requested. No new FFmpeg will be started until it exits.",
                     KILL_CONFIRM_TIMEOUT.as_secs()
                 ));
 

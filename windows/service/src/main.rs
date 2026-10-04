@@ -11,7 +11,7 @@ use std::collections::HashSet;
 use std::env;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitCode, Stdio};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc::{self, RecvTimeoutError, Sender},
@@ -57,22 +57,49 @@ pub enum Event {
 // Main
 // -----------------------------------------------------------------------------
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> ExitCode {
     // MediaMTX runs this executable as its runOnDemand command. In that mode it
     // is only a demand signal, not a Host.
     if env::args().any(|argument| argument == demand::SIGNAL_FLAG) {
-        return demand::run_signal();
+        return match demand::run_signal() {
+            Ok(()) => ExitCode::SUCCESS,
+
+            Err(error) => {
+                eprintln!("{error}");
+
+                ExitCode::FAILURE
+            }
+        };
     }
 
 
     console::widen();
 
-    logging::set_colour(
-        console::enable_ansi()
-    );
+    let level =
+        logging::init_from_args(
+            console::enable_ansi()
+        );
 
-    println!("Portable Game Caster - Windows Host");
-    println!("-----------------------------------");
+    logging::info("HOST", format_args!(
+        "Portable Game Caster Host starting (logging: {level:?})."
+    ));
+
+
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+
+        Err(error) => {
+            logging::error("HOST", format_args!(
+                "{error}"
+            ));
+
+            ExitCode::FAILURE
+        }
+    }
+}
+
+
+fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 
     let _instance_guard =
@@ -83,13 +110,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 
             None => {
-                println!(
-                    "Portable Game Caster Host is already running."
-                );
+                logging::info("HOST", format_args!(
+                    "Portable Game Caster Host is already running. Exiting."
+                ));
 
-                eprintln!(
-                    "[PGC][DEBUG] Rejected second Windows Host startup because another instance owns the machine-wide mutex."
-                );
+                logging::debug("HOST", format_args!(
+                    "Rejected this startup because another instance owns the machine-wide mutex."
+                ));
 
 
                 return Ok(());
@@ -119,10 +146,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mediamtx_path =
         find_mediamtx()?;
 
-    println!(
+    logging::debug("HOST", format_args!(
         "MediaMTX: {}",
         mediamtx_path.display()
-    );
+    ));
 
 
     // -------------------------------------------------------------------------
@@ -132,10 +159,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ffmpeg_path =
         ffmpeg::find_ffmpeg()?;
 
-    println!(
+    logging::debug("ENCODER", format_args!(
         "FFmpeg: {}",
         ffmpeg_path.display()
-    );
+    ));
 
 
     // -------------------------------------------------------------------------
@@ -153,7 +180,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let demand_address =
         demand_listener.address();
 
-    logging::host(format_args!(
+    logging::debug("DEMAND", format_args!(
         "Demand signal listening on {demand_address}."
     ));
 
@@ -182,9 +209,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &job,
         )?;
 
-    println!("MediaMTX started.");
-
-    logging::host(format_args!(
+    logging::info("HOST", format_args!(
         "MediaMTX started (PID {}).",
         mediamtx.id()
     ));
@@ -197,14 +222,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mdns =
         start_discovery()?;
 
-    println!(
+    logging::info("HOST", format_args!(
         "Advertising Portable Game Caster on the local network."
-    );
+    ));
 
-    println!();
-    println!("Host ready. FFmpeg starts when a viewer connects.");
-    println!("Press Ctrl+C to stop.");
-    println!();
+    logging::info("HOST", format_args!(
+        "Host ready. FFmpeg starts when a viewer connects. Press Ctrl+C to stop."
+    ));
 
 
     // -------------------------------------------------------------------------
@@ -231,22 +255,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     demand_signals.insert(id);
 
-                    if !was_active {
-                        logging::host(format_args!(
-                            "Demand became active (signal #{id})."
+                    if was_active {
+                        logging::debug("DEMAND", format_args!(
+                            "Additional demand signal #{id} connected ({} open).",
+                            demand_signals.len()
+                        ));
+                    } else {
+                        logging::info("DEMAND", format_args!(
+                            "Demand became active."
+                        ));
+
+                        logging::debug("DEMAND", format_args!(
+                            "MediaMTX opened demand signal #{id}: a reader wants the stream and nothing is publishing."
                         ));
                     }
                 }
 
                 Event::DemandClosed(id) => {
-                    if demand_signals.remove(&id)
-                        && demand_signals.is_empty()
-                    {
-                        logging::host(format_args!(
-                            "Demand became inactive (signal #{id} ended)."
-                        ));
+                    if demand_signals.remove(&id) {
+                        if demand_signals.is_empty() {
+                            logging::info("DEMAND", format_args!(
+                                "Demand became inactive."
+                            ));
 
-                        encoder.demand_ended();
+                            logging::debug("DEMAND", format_args!(
+                                "MediaMTX closed demand signal #{id}: no readers remain, or the publisher did not appear in time."
+                            ));
+
+                            encoder.demand_ended();
+                        } else {
+                            logging::debug("DEMAND", format_args!(
+                                "Demand signal #{id} closed ({} still open).",
+                                demand_signals.len()
+                            ));
+                        }
                     }
                 }
 
@@ -265,12 +307,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // ---------------------------------------------------------------------
 
         if let Some(status) = mediamtx.try_wait()? {
-            eprintln!(
-                "MediaMTX exited unexpectedly: {status}"
-            );
-
-            logging::host(format_args!(
-                "MediaMTX PID {} exited: {status}",
+            logging::warn("HOST", format_args!(
+                "MediaMTX PID {} exited unexpectedly: {status}",
                 mediamtx.id()
             ));
 
@@ -282,8 +320,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // demand it signalled died with it. Stop FFmpeg now; a fresh one
             // starts when the new MediaMTX reports demand.
             if !demand_signals.is_empty() {
-                logging::host(format_args!(
-                    "Demand cleared (MediaMTX exited)."
+                logging::debug("DEMAND", format_args!(
+                    "Demand reset: dropping {} signal(s) that belonged to the MediaMTX that exited.",
+                    demand_signals.len()
                 ));
             }
 
@@ -292,17 +331,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             encoder.stop("MediaMTX exited", false);
 
-            eprintln!(
-                "Restarting MediaMTX..."
-            );
+            logging::info("HOST", format_args!(
+                "Restarting MediaMTX."
+            ));
 
             thread::sleep(
                 Duration::from_secs(1)
             );
-
-            logging::host(format_args!(
-                "Starting MediaMTX."
-            ));
 
             mediamtx =
                 match start_mediamtx(
@@ -314,19 +349,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Ok(child) => child,
 
                     Err(error) => {
-                        logging::host(format_args!(
-                            "MediaMTX restart failed: {error}"
-                        ));
-
-                        return Err(error);
+                        return Err(
+                            format!("MediaMTX restart failed: {error}").into()
+                        );
                     }
                 };
 
-            println!(
-                "MediaMTX restarted."
-            );
-
-            logging::host(format_args!(
+            logging::info("HOST", format_args!(
                 "MediaMTX restarted (PID {}).",
                 mediamtx.id()
             ));
@@ -350,8 +379,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Shutdown
     // -------------------------------------------------------------------------
 
-    println!();
-    println!("Shutting down Portable Game Caster...");
+    logging::info("HOST", format_args!(
+        "Shutting down Portable Game Caster Host."
+    ));
+
+    logging::debug("HOST", format_args!(
+        "Shutdown order: FFmpeg first (so it releases the capture device), then MediaMTX, then discovery."
+    ));
 
 
     encoder.stop("Host shutdown", true);
@@ -362,7 +396,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = mediamtx.wait();
     }
 
-    logging::host(format_args!(
+    logging::info("HOST", format_args!(
         "MediaMTX PID {} stopped.",
         mediamtx.id()
     ));
@@ -371,7 +405,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = mdns.shutdown();
 
 
-    println!("Shutdown complete.");
+    logging::info("HOST", format_args!(
+        "Shutdown complete."
+    ));
 
     Ok(())
 }
@@ -456,8 +492,9 @@ fn start_mediamtx(
             )?;
 
 
-    // Output is relayed rather than inherited so every MediaMTX line carries
-    // the same UTC timestamp format as the Host and Client logs.
+    // Output is piped rather than inherited: the Host watches it for publisher
+    // readiness, and in Verbose relays it labelled as MTX with the same UTC
+    // timestamp format as every other line.
     //
     // The environment tells MediaMTX's runOnDemand command (this executable in
     // demand-signal mode) where to find the Host.
@@ -487,7 +524,7 @@ fn start_mediamtx(
         let events =
             events.clone();
 
-        logging::relay_output(stdout, false, "MTX", move |line| {
+        logging::relay_output(stdout, logging::Source::Mtx, move |line| {
             if line.contains(PUBLISHER_READY_TEXT) {
                 let _ = events.send(Event::PublisherReady);
             }
@@ -495,7 +532,7 @@ fn start_mediamtx(
     }
 
     if let Some(stderr) = child.stderr.take() {
-        logging::relay_output(stderr, true, "MTX", |_| {});
+        logging::relay_output(stderr, logging::Source::Mtx, |_| {});
     }
 
 
@@ -565,9 +602,9 @@ fn start_discovery()
     mdns.register(service)?;
 
 
-    println!(
+    logging::debug("HOST", format_args!(
         "Discovery host: {host_name}"
-    );
+    ));
 
 
     Ok(mdns)

@@ -191,12 +191,16 @@ impl ChildJob {
     pub fn create() -> Self {
         match platform::Job::create() {
             Ok(job) => {
+                crate::logging::debug("HOST", format_args!(
+                    "Job object created; child processes are terminated if the Host is killed."
+                ));
+
                 Self { job: Some(job) }
             }
 
             Err(error) => {
-                crate::logging::host(format_args!(
-                    "WARNING: could not create a job object ({error}). Child processes will not be terminated automatically if the Host is killed."
+                crate::logging::debug_warn("HOST", format_args!(
+                    "could not create a job object ({error}). Child processes will not be terminated automatically if the Host is killed."
                 ));
 
                 Self { job: None }
@@ -211,8 +215,8 @@ impl ChildJob {
         };
 
         if let Err(error) = job.assign(child) {
-            crate::logging::host(format_args!(
-                "WARNING: could not add {name} PID {} to the Host job object ({error}).",
+            crate::logging::debug_warn("HOST", format_args!(
+                "could not add {name} PID {} to the Host job object ({error}).",
                 child.id()
             ));
         }
