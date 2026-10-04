@@ -155,15 +155,13 @@ Current relevant config:
 ```yaml
 readTimeout: 2s
 writeTimeout: 10s
-```
-
-Transitional PowerShell bridge also uses:
-
-```yaml
-runOnDemandRestart: true
+runOnDemand: $PGC_HOST_EXE --demand-signal
+runOnDemandRestart: false
 runOnDemandStartTimeout: 15s
-runOnDemandCloseAfter: 5s
+runOnDemandCloseAfter: 10s
 ```
+
+There is no active `runOnUnDemand` command.
 
 The earlier `readTimeout: 10s` allowed stale SRT publisher state to persist too long after shutdown.
 
@@ -175,25 +173,150 @@ During recovery debugging, MediaMTX 1.21.1 source was inspected directly.
 
 Verified:
 
-- Windows external commands run inside a kill-on-close Job Object.
-- Stopping runOnDemand kills the command tree.
-- Killing MediaMTX closes the Job Object and kills its command tree.
-- Therefore orphaned PowerShell start scripts after a normal MediaMTX kill should not be assumed.
-- `runOnDemandRestart: true` uses a fixed approximately five-second restart pause.
-- Publisher loss does not reset the current on-demand state.
-- Removing the final active reader arms close-after.
-- A DESCRIBE waiting for a source is not counted as an active reader.
-- A recovering Client may therefore be waiting while MediaMTX considers no reader active.
-- The close-after timer can stop runOnDemand while that DESCRIBE is still waiting.
-- `runOnDemandStartTimeout` applies to a fresh command-start cycle and rejects waiting requests when it expires.
+- a DESCRIBE waiting for a source is not counted as an active reader
+- publisher loss does not reset the existing on-demand state
+- removing the final active reader arms close-after
+- therefore a recovering Client can still be waiting while MediaMTX considers no active reader present
+- `runOnDemandStartTimeout` applies to a fresh command-start cycle and rejects waiting requests when it expires
 
-This mismatch is architectural.
+The architectural consequence remains important: MediaMTX is not the authoritative FFmpeg lifecycle owner.
 
-Do not attempt to solve it solely with sleep/timeout tuning.
+The Host now owns FFmpeg directly while MediaMTX only creates and destroys a lightweight demand helper process.
 
-## Transitional PowerShell bridge
+## Native Host demand signaling
 
-The legacy/current bridge is:
+Current implementation lives primarily in:
+
+```text
+windows/service/src/demand.rs
+```
+
+MediaMTX launches:
+
+```text
+pgc-host-windows.exe --demand-signal
+```
+
+Helper behavior:
+
+- helper mode is handled before normal Host singleton/console startup
+- helper connects to the already-running Host over localhost TCP
+- helper sends the expected demand hello line
+- helper holds the TCP connection open
+- connection open = one active demand signal
+- helper termination/connection close = that signal ended
+
+The Host demand listener:
+
+- binds `127.0.0.1` on an ephemeral port
+- exposes the selected port to MediaMTX through Host-provided environment/config
+- ignores localhost connections that do not send the expected hello line
+- can reset/drop all signals when MediaMTX exits
+
+This architecture intentionally allows arbitrary compatible RTSP readers to cause demand through MediaMTX without requiring PGC-specific Client control messages.
+
+## Native Host FFmpeg ownership
+
+Current implementation lives primarily in:
+
+```text
+windows/service/src/ffmpeg.rs
+```
+
+FFmpeg discovery order:
+
+1. `PGC_FFMPEG_PATH`
+2. `C:\ffmpeg\bin\ffmpeg.exe`
+3. `ffmpeg\ffmpeg.exe` beside the Host executable
+
+Missing FFmpeg currently fails Host startup rather than waiting until first viewer demand.
+
+The Host directly owns the encoder child handle.
+
+Current lifecycle rules:
+
+- no demand -> no FFmpeg
+- first demand -> launch FFmpeg
+- at most one owned FFmpeg
+- unexpected FFmpeg exit while demand remains -> restart with bounded backoff
+- demand disappears -> wait grace period, then stop FFmpeg
+- Host shutdown -> stop/confirm FFmpeg before stopping MediaMTX
+- MediaMTX unexpected exit -> clear demand, stop/confirm FFmpeg, then restart MediaMTX
+
+Restart backoff:
+
+```text
+attempt 1: 1s
+attempt 2: 2s
+subsequent: 5s
+```
+
+Backoff resets after approximately 10 seconds of healthy encoder operation.
+
+### Graceful stop
+
+Stop path:
+
+1. send `q` to FFmpeg stdin
+2. wait up to approximately 3 seconds for graceful exit
+3. if still running, terminate/kill
+4. confirm exit for up to approximately 5 additional seconds
+5. if still alive, keep that process owned and do not launch a replacement encoder
+
+Real Windows validation confirmed FFmpeg accepts `q` over the owned stdin pipe and exits cleanly in the normal no-demand path.
+
+## Current no-demand timing
+
+MediaMTX:
+
+```text
+runOnDemandCloseAfter: 10s
+```
+
+Host:
+
+```text
+FFmpeg no-demand grace: 5s
+```
+
+Observed normal flow:
+
+```text
+last RTSP reader leaves
+-> ~10s
+-> demand helper ends
+-> Host logs demand inactive
+-> ~5s
+-> Host sends q
+-> FFmpeg exits cleanly
+```
+
+Total time from last reader to idle is approximately 15-16 seconds.
+
+This is currently considered conservative but stable. Do not shorten it merely because it feels long; first test rapid reconnect/recovery behavior and verify shorter timing does not reintroduce thrash.
+
+## Windows Job Object containment
+
+Current implementation:
+
+```text
+windows/service/src/job.rs
+```
+
+The Host creates a kill-on-close Windows Job Object and assigns MediaMTX and FFmpeg to it on a best-effort basis.
+
+Purpose:
+
+- if the Host is hard-killed, owned relay/encoder children should also die
+- reduce orphan processes after abnormal termination
+
+Assignment failure logs a warning and does not currently fail Host startup.
+
+Target-platform hard-kill behavior should continue to be included in future stress/regression testing.
+
+## Legacy PowerShell bridge
+
+The old architecture was:
 
 ```text
 MediaMTX
@@ -209,52 +332,70 @@ runOnUnDemand
 -> stop-gameplay.ps1
 ```
 
-Diagnostics added during recovery work include:
+It also used a PID file and lifecycle log.
 
-- PowerShell PID
-- FFmpeg PID
-- FFmpeg process snapshots
-- previous PID-file value
-- launch time
-- exit code
-- stop branch/reason
-- lifecycle log file
+The scripts remain under:
 
-`stop-gameplay.ps1` was hardened to:
+```text
+windows/service/scripts/
+```
 
-- verify exact FFmpeg process
-- request termination
-- wait up to five seconds
-- remove PID file only after confirmed exit
-- retain PID state and warn if termination times out
+with LEGACY / DEPRECATED headers for reference/rollback context, but they are no longer referenced by the active MediaMTX configuration or Host lifecycle.
 
-This bridge is temporary.
+There is no `gameplay-lifecycle.log` in the native architecture.
 
-Once native Host FFmpeg ownership is validated, do not continue investing in PID-file/process-script architecture except for rollback/reference cleanup.
+Do not reintroduce PowerShell/PID-file ownership without an explicit architecture decision.
 
-## Native Host FFmpeg ownership
+## Native Host Windows validation checkpoint
 
-Approved target:
+Basic real Windows hands-on validation passed after the native ownership implementation.
 
-- Rust Host directly launches FFmpeg.
-- Host retains child/process handle.
-- Host owns intentional stop.
-- Host owns restart.
-- Host owns shutdown cleanup.
-- Host guarantees at most one FFmpeg.
-- PID file is not primary ownership.
-- MediaMTX remains relay/demand infrastructure.
+Observed working behaviors included:
 
-Product requirement:
+- Host starts idle with no FFmpeg
+- first Client demand launches FFmpeg
+- real DirectShow HD60 S+ capture opens
+- NVENC publishes to MediaMTX over SRT
+- Client receives and plays RTSP stream
+- FFmpeg unexpected exit is detected and restarted while demand remains
+- MediaMTX unexpected exit causes Host cleanup and restart
+- graceful no-demand FFmpeg stop accepts `q`
+- no PowerShell appears in the active lifecycle
+- Host returns to lightweight idle state after demand ends
 
-When no viewers exist:
+Initial resource baseline on the prototype machine:
 
-- no FFmpeg
-- capture device unopened
-- NVENC idle
-- no publisher bandwidth
+```text
+idle: ~35 MB RAM, effectively no CPU/GPU use
+active: ~240 MB RAM, ~11% GPU
+```
 
-Do not simplify the architecture into an always-on encoder merely to avoid lifecycle complexity.
+These are informal first measurements, not a full profiling study.
+
+## First-stream slow-reader / audio-warble observation
+
+On the first real connection after the native architecture update, the stream audio was noticeably warbly/distorted and MediaMTX reported:
+
+```text
+reader is too slow, discarding 1071 frames
+```
+
+After restarting the stream, subsequent sessions were substantially healthier.
+
+No root cause is established.
+
+Possible areas to investigate later:
+
+- first capture-device open after Host startup
+- DirectShow/capture-card warm-up
+- initial FFmpeg clock establishment
+- MediaMTX initial buffering/burst behavior
+- ffplay joining behind the live edge
+- initial A/V synchronization
+
+Do not assume this is equivalent to shader compilation/cache warm-up; there is currently no evidence of a one-time compiled artifact or persistent cache causing the behavior.
+
+Do not change buffering/timing parameters based on this single observation. Reproduce and correlate first.
 
 ## Host singleton
 
@@ -364,7 +505,7 @@ Backlog:
 
 Do not expand the interim parser prematurely without a real failure case.
 
-## Client state rules
+## Client state / control rules
 
 - UI state describes observable reality.
 - Playing requires decoded media.
@@ -383,6 +524,17 @@ Timeout copy:
 ```text
 cold: Stream did not start.
 recovery: Stream did not resume.
+```
+
+Current diagnostic gap:
+
+Explicit actions/final Idle state are not always logged. A session can end with the last `[STATE]` line still showing `Playing | Connected.` even though the UI has returned to Idle.
+
+The unified logging pass should add action breadcrumbs and final-state logs such as:
+
+```text
+[ACTION] Stop Stream requested.
+[STATE]  Idle | Ready to search.
 ```
 
 ## Countdown implementation
@@ -429,9 +581,7 @@ Host does not yet have finalized Normal / Debug / Verbose parity.
 
 Some diagnostic output remains unconditional.
 
-MediaMTX output is currently relayed through the Host so Host-side UTC timestamps can be attached.
-
-This removed MediaMTX's previous console colour because the process now sees a pipe instead of a terminal.
+MediaMTX and FFmpeg output are currently relayed through the Host with Host-side UTC timestamps/source labels.
 
 ### Unified logging target
 
@@ -459,7 +609,7 @@ Verbose:
 Presentation:
 
 - dim timestamp
-- fixed-width columns
+- fixed-width source/category columns
 - stable colours
 - same category colours across Host and Client
 - aligned message column
@@ -478,6 +628,8 @@ Behavior should remain best-effort.
 
 Unsupported terminals or redirected output should not fail startup.
 
+The Host also adds colour to MediaMTX severity tags and greys timestamp prefixes when output is attached to an ANSI-capable terminal because MediaMTX itself does not force colour when stdout is piped.
+
 ## Logging relay caveat
 
 FFmpeg progress uses carriage-return updates.
@@ -485,10 +637,13 @@ FFmpeg progress uses carriage-return updates.
 When mixed with stamped newline-oriented logs:
 
 - progress lines can visually collide with a newly stamped line
+- structured logs can be glued into FFmpeg progress text
+- source lines can split mid-message
 - stale trailing characters can remain
-- progress may display one update late
 
-The unified logging pass should preserve readable progress without building a large terminal-rendering framework.
+This is visible in current Windows logs and is a presentation problem, not evidence that lifecycle events themselves are corrupted.
+
+The unified logging pass should preserve readable progress without building an unnecessarily large terminal-rendering subsystem.
 
 ## Audio routing prototype
 
@@ -543,9 +698,7 @@ Future GC575 lacks analog input; PC Line In or another capture-audio path may be
 - rapid MediaMTX failure/restart
 - awkward timing around demand start/stop
 
-### Native Host ownership validation
-
-Verify:
+### Native Host ownership regression checks
 
 - Host idle contains no ffmpeg.exe
 - first demand launches exactly one FFmpeg
@@ -553,5 +706,7 @@ Verify:
 - FFmpeg failure while demand exists causes Host restart
 - MediaMTX failure does not leave stale FFmpeg
 - repeated abuse never produces multiple owned FFmpeg instances
+- Host hard-kill terminates MediaMTX and FFmpeg through Job Object containment
 - Host shutdown leaves no MediaMTX or FFmpeg process
 - PowerShell is absent from normal capture lifecycle
+- idle Task Manager footprint remains near-zero on CPU/GPU
