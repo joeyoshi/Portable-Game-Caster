@@ -15,40 +15,50 @@ This backlog is ordered approximately by current priority, not by strict release
 
 ## Immediate — Windows Host native FFmpeg ownership
 
-**Status: In Progress**
+**Status: Done — basic Windows hands-on validation passed; broader stress testing remains useful**
 
-Replace MediaMTX/PowerShell FFmpeg ownership with native Rust Host ownership while preserving demand-driven idle behavior.
-
-Requirements:
+Accepted architecture:
 
 - Host remains lightweight while idle
 - FFmpeg stopped while no viewers exist
 - capture device unopened while idle
 - NVENC idle while idle
 - no gameplay publisher bandwidth while idle
-- MediaMTX may provide demand information
-- MediaMTX must not own FFmpeg lifecycle
+- MediaMTX provides reader-demand signaling but does not own FFmpeg lifecycle
 - Host directly launches FFmpeg
 - Host retains FFmpeg process handle
 - Host monitors expected/unexpected exit
 - Host restarts FFmpeg while demand remains
 - Host stops FFmpeg when demand ends
 - Host guarantees no more than one owned FFmpeg
-- Host shutdown leaves no orphan FFmpeg or MediaMTX
-- FFmpeg-kill recovery works
-- MediaMTX-kill recovery works
-- rapid/awkward failure timing does not produce duplicate encoders
-- remove PowerShell/PID-file dependence from active lifecycle after validation
+- Host shutdown cleans FFmpeg and MediaMTX
+- no PowerShell/PID-file dependence in the active lifecycle
+- MediaMTX and FFmpeg are assigned to a Host-owned Windows Job Object on a best-effort basis
 
-Current hardcoded Elgato/NVENC profile is acceptable for this milestone.
+Current demand signal:
 
-Capture portability is a later milestone.
+```text
+MediaMTX runOnDemand
+-> pgc-host-windows.exe --demand-signal
+-> held localhost TCP connection to running Host
+-> Host starts/stops FFmpeg
+```
+
+Current teardown is intentionally conservative:
+
+- 10s MediaMTX `runOnDemandCloseAfter`
+- 5s Host no-demand FFmpeg grace
+- approximately 15s from last reader to encoder shutdown, plus graceful FFmpeg exit
+
+Initial real Windows validation showed approximately 35 MB Host idle memory with effectively no CPU/GPU activity, and approximately 240 MB / ~11% GPU while actively streaming on the current prototype system.
+
+Further stress testing remains useful for awkward-timing failure cases, but native Host ownership is now the accepted architecture.
 
 ---
 
 ## Immediate — unified Host + Client logging UX / log levels
 
-**Status: Planned — expected immediately after Host lifecycle work**
+**Status: Planned — next major pass**
 
 Create one shared logging semantics and presentation model across Host and Client.
 
@@ -68,7 +78,7 @@ Create one shared logging semantics and presentation model across Host and Clien
 - discovery/connection details
 - process ownership/recovery decisions
 - health state
-- still event-driven
+- event-driven
 - no raw FFmpeg/ffplay/MediaMTX firehose
 
 #### Verbose
@@ -96,13 +106,14 @@ Create one shared logging semantics and presentation model across Host and Clien
 - redirected/file output remains plain text
 - terminal styling centralized
 - preserve timestamped MediaMTX observability
-- restore useful Host terminal colour
-- preserve FFmpeg progress readability where possible
+- restore/preserve useful Host terminal colour
+- prevent FFmpeg carriage-return progress output from visually corrupting structured log lines
 
 Potential PGC categories:
 
 - APP
 - STATE
+- ACTION
 - CONNECT
 - DISCOVERY
 - PLAYER
@@ -116,6 +127,86 @@ Potential PGC categories:
 
 ---
 
+## Immediate — Client action and final-state breadcrumbs
+
+**Status: Planned — bundle with unified logging pass**
+
+The diagnostic timeline must match the actual UI state.
+
+Add concise Debug breadcrumbs for explicit user actions:
+
+- Search
+- Retry
+- Cancel
+- Stop Stream
+- Quit
+- future Synchronize
+- future configuration changes
+
+Also log final state transitions such as:
+
+```text
+[ACTION]     Stop Stream requested.
+[STATE]      Idle | Ready to search.
+```
+
+A log must not end at `Playing | Connected.` when the Client has actually returned to Idle.
+
+Preserve:
+
+- stale-worker invalidation
+- local Stop/Cancel behavior
+- no Client -> Host session-control coupling
+
+---
+
+## Investigate occasional first-stream reader lag / audio warble
+
+**Status: Planned / observe before changing transport settings**
+
+First real Windows connection after the native Host ownership update produced:
+
+- distorted/warbly audio
+- MediaMTX `reader is too slow`
+- 1,071 discarded frames
+
+Immediate subsequent streams were substantially healthier.
+
+Do not assume a shader-cache-like mechanism; no such cause has been established.
+
+Investigate whether this correlates specifically with:
+
+- first capture-device open after Host startup
+- FFmpeg/DirectShow warm-up
+- initial MediaMTX buffering/burst behavior
+- ffplay joining behind the live edge
+- initial A/V clock establishment
+
+Do not change buffer/timing parameters without reproducible evidence.
+
+---
+
+## Host resource profiling
+
+**Status: Planned / low priority**
+
+Current prototype baseline from first Windows validation:
+
+- idle: ~35 MB RAM, effectively no CPU/GPU use
+- active 1080p60 stream: ~240 MB RAM, ~11% GPU
+
+Later profiling should measure:
+
+- idle CPU wakeups
+- idle GPU activity
+- power impact
+- capture-device/USB or PCIe activity
+- network traffic
+- long-duration active memory behavior
+- effect of Debug and Verbose logging modes
+
+---
+
 ## Client recovery / truthfulness
 
 **Status: Core UX approved; broader soak testing remains**
@@ -125,10 +216,8 @@ Accepted:
 - Playing only after decoded media confirmed
 - reconnect states only after a healthy Playing state is lost
 - restored RTSP moves to WaitingForStream
-- cold timeout:
-  - `Stream did not start.`
-- recovery timeout:
-  - `Stream did not resume.`
+- cold timeout: `Stream did not start.`
+- recovery timeout: `Stream did not resume.`
 - monotonic deadline-driven reconnect countdown
 - monotonic deadline-driven warm-up countdown
 - improved discovery countdown cadence
@@ -146,25 +235,13 @@ Remaining:
 
 ---
 
-## Client session-control / observability polish
+## Client UI polish
 
-**Status: Planned**
+**Status: Future / very low priority**
 
-Add concise Debug breadcrumbs for explicit user actions:
-
-- Search
-- Retry
-- Cancel
-- Stop Stream
-- Quit
-- future Synchronize
-- future configuration changes
-
-Preserve:
-
-- stale-worker invalidation
-- local Stop/Cancel behavior
-- no Client -> Host session-control coupling
+- investigate status/message text appearing selected/highlighted after state updates
+- revisit layout, typography, colours, and visual identity once the app's look direction is established
+- avoid spending architecture time on cosmetic polish unless it becomes disruptive
 
 ---
 
@@ -397,6 +474,21 @@ Eventually remove Homebrew as a hard runtime dependency where licensing/distribu
 
 ---
 
+## Teardown grace tuning
+
+**Status: Deferred optimization**
+
+Current last-reader-to-FFmpeg-stop delay is intentionally about 15 seconds:
+
+- 10s MediaMTX demand close-after
+- 5s Host encoder grace
+
+This is longer than the old lifecycle but currently stable.
+
+Only shorten it after rapid reconnect/recovery testing demonstrates that doing so does not reintroduce encoder thrash or recovery races.
+
+---
+
 ## Known stream cleanup items
 
 **Status: Deferred**
@@ -406,6 +498,25 @@ Eventually remove Homebrew as a hard runtime dependency where licensing/distribu
 - cold-source startup polish
 
 Do not reintroduce RTSP ingest unless a fundamentally new approach addresses the prior DirectShow backpressure/choppiness problem.
+
+---
+
+## Code archaeology / maintainability pass
+
+**Status: Future / low priority**
+
+Treat code comments and commit history as archaeological documentation for future maintainers.
+
+Future cleanup should:
+
+- add comments where rationale is not obvious from code
+- document why non-obvious constraints exist, not merely restate syntax
+- preserve important failed-experiment context near sensitive code where useful
+- improve names/module boundaries where they obscure intent
+- remove stale comments when architecture changes
+- prefer comments that remain understandable years later without requiring conversational context
+
+Do not blanket-comment obvious code; prioritize decisions, invariants, workarounds, platform quirks, and failure-mode reasoning.
 
 ---
 
@@ -474,6 +585,10 @@ Workflow:
 - Windows native mDNS advertiser
 - Windows MediaMTX supervisor
 - Windows machine-wide single-instance guard
+- native Windows Host FFmpeg lifecycle ownership
+- demand-signal helper architecture
+- Windows Job Object child containment
+- demand-driven no-encoder idle state
 - truthful Client state model
 - WaitingForStream semantics
 - contextual Cancel / Stop Stream / Retry controls
@@ -482,6 +597,5 @@ Workflow:
 - Client UTC millisecond timestamps
 - ffplay stream metadata parsing
 - initial stalled-media watchdog
-- MediaMTX lifecycle instrumentation
-- source-verified diagnosis of runOnDemand demand-model mismatch
+- source-verified diagnosis of MediaMTX runOnDemand demand-model mismatch
 - best-effort wider Windows Host console
