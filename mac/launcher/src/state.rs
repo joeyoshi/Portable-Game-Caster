@@ -8,7 +8,10 @@ pub enum AppState {
 
     Connecting(String),
 
-    WaitingForStream(String),
+    WaitingForStream {
+        host: String,
+        fallback_seconds_remaining: Option<u8>,
+    },
 
     Playing(String),
 
@@ -45,8 +48,20 @@ impl AppState {
                 format!("Connecting to {host}…")
             }
 
-            AppState::WaitingForStream(host) => {
+            AppState::WaitingForStream {
+                host,
+                fallback_seconds_remaining: None,
+            } => {
                 format!("Waiting for stream from {host}…")
+            }
+
+            AppState::WaitingForStream {
+                host: _,
+                fallback_seconds_remaining: Some(seconds_remaining),
+            } => {
+                format!(
+                    "Stream startup is taking longer than expected… {seconds_remaining}s"
+                )
             }
 
             AppState::Playing(host) => {
@@ -85,7 +100,7 @@ impl AppState {
             AppState::Discovering
                 | AppState::Resolving(_)
                 | AppState::Connecting(_)
-                | AppState::WaitingForStream(_)
+                | AppState::WaitingForStream { .. }
                 | AppState::ReconnectingStream { .. }
                 | AppState::ReconnectingHost { .. }
         )

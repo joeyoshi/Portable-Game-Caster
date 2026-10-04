@@ -29,9 +29,22 @@ pub type SharedPlayer =
 // Connection policy
 // -----------------------------------------------------------------------------
 
-const MEDIA_WARMUP_TIMEOUT:
+const MEDIA_WARMUP_GRACE_PERIOD:
+    Duration =
+        Duration::from_secs(10);
+
+
+const MEDIA_WARMUP_FALLBACK_TIMEOUT:
     Duration =
         Duration::from_secs(15);
+
+
+const MEDIA_WARMUP_TIMEOUT:
+    Duration =
+        Duration::from_secs(
+            MEDIA_WARMUP_GRACE_PERIOD.as_secs()
+                + MEDIA_WARMUP_FALLBACK_TIMEOUT.as_secs()
+        );
 
 
 const COLD_SERVICE_PROBE_TIMEOUT:
@@ -186,9 +199,10 @@ pub fn run_stream_flow(
 
 
     send(
-        AppState::WaitingForStream(
-            host.clone()
-        )
+        AppState::WaitingForStream {
+            host: host.clone(),
+            fallback_seconds_remaining: None,
+        }
     );
 
 
@@ -197,6 +211,7 @@ pub fn run_stream_flow(
         _initial_info,
     ) =
         match wait_for_media_with_retries(
+            &send,
             &endpoint,
             &player_handle,
             MEDIA_WARMUP_TIMEOUT,
@@ -216,7 +231,7 @@ pub fn run_stream_flow(
                 send(
                     AppState::Error(
                         format!(
-                            "Connected to {host}, but the stream did not begin producing media within 15 seconds."
+                            "The streaming service at {host} was reachable, but the stream did not begin producing media within 25 seconds."
                         )
                     )
                 );
@@ -234,7 +249,7 @@ pub fn run_stream_flow(
                 send(
                     AppState::Error(
                         format!(
-                            "Connected to {host}, but the streaming service became unavailable before media started."
+                            "The streaming service at {host} became unavailable before media started."
                         )
                     )
                 );
@@ -507,13 +522,15 @@ where
 
 
         send(
-            AppState::WaitingForStream(
-                host.clone()
-            )
+        AppState::WaitingForStream {
+            host: host.clone(),
+            fallback_seconds_remaining: None,
+        }
         );
 
 
         match wait_for_media_with_retries(
+            send,
             endpoint,
             player_handle,
             MEDIA_WARMUP_TIMEOUT,
@@ -571,7 +588,7 @@ where
                 send(
                     AppState::Error(
                         format!(
-                            "Connection to {host} was restored, but the stream did not begin producing media within 15 seconds."
+                            "Connection to {host} was restored, but the stream did not begin producing media within 25 seconds."
                         )
                     )
                 );
@@ -610,28 +627,70 @@ where
 // This is especially useful while runOnDemand / FFmpeg are warming up.
 // -----------------------------------------------------------------------------
 
-fn wait_for_media_with_retries(
+fn wait_for_media_with_retries<F>(
+    send: &F,
     endpoint: &discovery::StreamEndpoint,
     player_handle: &SharedPlayer,
     timeout: Duration,
-) -> MediaWarmupResult {
+) -> MediaWarmupResult
+where
+    F: Fn(AppState),
+{
+    let warmup_started =
+        Instant::now();
+
+
+    let grace_deadline =
+        warmup_started
+            + MEDIA_WARMUP_GRACE_PERIOD;
+
+
     let deadline =
-        Instant::now()
+        warmup_started
             + timeout;
 
 
     logging::debug(
         "HEALTH",
         format_args!(
-            "Waiting up to {} seconds for confirmed media flow",
+            "Media warm-up beginning for {}; allowing up to {} seconds for confirmed media flow",
+            endpoint.host,
             timeout.as_secs()
         ),
     );
 
 
+    logging::debug(
+        "HEALTH",
+        format_args!(
+            "Starting initial {}-second media warm-up grace period",
+            MEDIA_WARMUP_GRACE_PERIOD.as_secs()
+        ),
+    );
+
+
+    let mut fallback_started =
+        false;
+
+
+    let mut last_fallback_seconds:
+        Option<u8> =
+            None;
+
+
     while Instant::now()
         < deadline
     {
+        update_media_warmup_state(
+            send,
+            &endpoint.host,
+            grace_deadline,
+            deadline,
+            &mut fallback_started,
+            &mut last_fallback_seconds,
+        );
+
+
         // ---------------------------------------------------------------------
         // Is RTSP still reachable?
         // ---------------------------------------------------------------------
@@ -697,11 +756,26 @@ fn wait_for_media_with_retries(
         // ---------------------------------------------------------------------
 
         loop {
+            update_media_warmup_state(
+                send,
+                &endpoint.host,
+                grace_deadline,
+                deadline,
+                &mut fallback_started,
+                &mut last_fallback_seconds,
+            );
+
+
             if Instant::now()
                 >= deadline
             {
                 terminate_player(
                     player_handle
+                );
+
+
+                log_media_warmup_timeout(
+                    warmup_started
                 );
 
 
@@ -715,6 +789,15 @@ fn wait_for_media_with_retries(
                         info
                     )
                 ) => {
+                    logging::debug(
+                        "HEALTH",
+                        format_args!(
+                            "Media warm-up succeeded after {:.1} seconds",
+                            warmup_started.elapsed().as_secs_f64()
+                        ),
+                    );
+
+
                     return MediaWarmupResult::Started {
                         receiver,
                         info,
@@ -835,7 +918,126 @@ fn wait_for_media_with_retries(
     }
 
 
+    log_media_warmup_timeout(
+        warmup_started
+    );
+
+
     MediaWarmupResult::TimedOut
+}
+
+
+// -----------------------------------------------------------------------------
+// Media warm-up UI and diagnostics
+// -----------------------------------------------------------------------------
+
+fn update_media_warmup_state<F>(
+    send: &F,
+    host: &str,
+    grace_deadline: Instant,
+    deadline: Instant,
+    fallback_started: &mut bool,
+    last_fallback_seconds: &mut Option<u8>,
+)
+where
+    F: Fn(AppState),
+{
+    let now =
+        Instant::now();
+
+
+    if now < grace_deadline {
+        return;
+    }
+
+
+    if !*fallback_started {
+        *fallback_started = true;
+
+
+        logging::debug(
+            "HEALTH",
+            format_args!(
+                "Initial {}-second media warm-up grace period expired",
+                MEDIA_WARMUP_GRACE_PERIOD.as_secs()
+            ),
+        );
+
+
+        logging::debug(
+            "HEALTH",
+            format_args!(
+                "Starting visible {}-second media warm-up fallback countdown",
+                MEDIA_WARMUP_FALLBACK_TIMEOUT.as_secs()
+            ),
+        );
+    }
+
+
+    let seconds_remaining =
+        countdown_seconds_remaining(
+            deadline,
+            MEDIA_WARMUP_FALLBACK_TIMEOUT.as_secs() as u8,
+        );
+
+
+    if *last_fallback_seconds
+        == Some(
+            seconds_remaining
+        )
+    {
+        return;
+    }
+
+
+    *last_fallback_seconds =
+        Some(
+            seconds_remaining
+        );
+
+
+    send(
+        AppState::WaitingForStream {
+            host: host.to_string(),
+            fallback_seconds_remaining: Some(seconds_remaining),
+        }
+    );
+}
+
+
+fn countdown_seconds_remaining(
+    deadline: Instant,
+    maximum: u8,
+) -> u8 {
+    let milliseconds =
+        deadline
+            .saturating_duration_since(
+                Instant::now()
+            )
+            .as_millis();
+
+
+    if milliseconds == 0 {
+        return 0;
+    }
+
+
+    ((milliseconds + 999) / 1000)
+        .min(maximum as u128)
+        as u8
+}
+
+
+fn log_media_warmup_timeout(
+    warmup_started: Instant,
+) {
+    logging::debug(
+        "HEALTH",
+        format_args!(
+            "Media warm-up timed out after {:.1} seconds without confirmed media flow",
+            warmup_started.elapsed().as_secs_f64()
+        ),
+    );
 }
 
 
