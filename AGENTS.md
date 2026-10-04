@@ -9,7 +9,67 @@ Portable Game Caster (PGC) is a free/open-source local-network console gameplay 
 - Primary implementation language: Rust
 - Repository: `joeyoshi/PortableGameCaster`
 - Primary development branch: `master`
+- Stable milestone/release branch: `main`
 - Goal: portable, native-feeling, resilient, transparent software that is simple when healthy and explicit when something fails.
+
+## Development branch model
+
+PGC uses a lightweight feature-branch workflow.
+
+```text
+main
+  stable milestone / release baseline
+
+master
+  integrated development branch
+
+feature/*, fix/*, refactor/*, spike/*
+  short-lived working branches
+```
+
+Branch roles:
+
+- `main`
+  - stable milestone/release baseline
+  - should move less frequently than `master`
+  - merge from `master` at meaningful project milestones or release checkpoints
+- `master`
+  - integrated development state
+  - contains accepted, hands-on validated feature work
+  - may remain ahead of `main` across multiple completed feature sets
+- short-lived working branches
+  - contain one coherent feature set, fix, refactor, or experiment
+  - frequent commits are encouraged
+  - iterative or destructive development is acceptable
+  - merge into `master` only after hands-on validation/acceptance
+  - delete after merge so the active branch list remains clean; Git history and the merge/PR preserve the archaeological record
+
+Preferred flow:
+
+```text
+master
+  -> feature/<goal>
+  -> implementation commits / Claude tickets
+  -> hands-on validation
+  -> consolidated documentation sync
+  -> PR or merge into master
+  -> delete feature branch
+
+master
+  -> project milestone / release readiness
+  -> project-level documentation and release review
+  -> PR into main
+```
+
+Use descriptive branch names that preserve intent, for example:
+
+- `feature/host-client-logging`
+- `feature/host-device-config`
+- `fix/client-first-connect-sync`
+- `refactor/player-health`
+- `spike/native-playback`
+
+Prefer non-squash merges when the intermediate commits have useful archaeological value. The exact merge strategy may still be chosen case-by-case.
 
 ## Product principles
 
@@ -107,12 +167,16 @@ Do not automatically rewrite canonical docs during every coding ticket unless th
 
 The repository docs are shared project memory for the user, ChatGPT, and coding agents.
 
-1. Product/architecture decisions may be recorded in ROADMAP and DECISIONS immediately.
+1. Product/architecture decisions may be recorded in ROADMAP and DECISIONS immediately when useful.
 2. Experimental implementation does not automatically become architectural truth.
-3. Coding agents flag documentation impact in every report.
-4. After hands-on validation/approval, synchronize ARCHITECTURE and DEV-NOTES to accepted behavior.
-5. Prefer committing accepted code and its documentation sync together.
-6. When a milestone is declared approved or ready to commit, check documentation before considering the checkpoint complete.
+3. Coding agents flag documentation impact in every report, even when no immediate doc edit is made.
+4. Canonical documentation updates are normally consolidated at meaningful checkpoints instead of after every small implementation ticket.
+5. Before merging an accepted working branch into `master`, reconcile accumulated documentation impact so `master` does not knowingly describe architecture or behavior older than the code being merged.
+6. Before merging `master` into `main`, perform a broader project-level documentation/release review.
+7. Prefer committing accepted code and its documentation sync together when practical.
+8. A milestone is not fully synchronized until its documentation impact has been reviewed.
+
+This cadence is intentionally milestone-based rather than ticket-based. Small fixes may accumulate documentation impact until the next feature checkpoint unless they change a durable rule, decision, constraint, or priority that should be recorded immediately.
 
 ### Document responsibilities
 
