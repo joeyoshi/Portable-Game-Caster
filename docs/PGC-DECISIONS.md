@@ -263,6 +263,10 @@ A few seconds of startup is acceptable.
 
 An always-on publisher is not an acceptable simplification of Host lifecycle.
 
+### Validated outcome
+
+Initial Windows hands-on validation of the native Host architecture measured roughly 35 MB RAM with effectively no CPU/GPU activity while idle. The demand-driven requirement remains justified and practical.
+
 ---
 
 ## 2026-10 — MediaMTX should not own FFmpeg lifecycle
@@ -281,39 +285,44 @@ In particular:
 
 - a waiting DESCRIBE is not counted as a reader
 - close-after may expire while the Client is still waiting
-- runOnDemand restart uses a fixed delay
-- restart and close timers can collide
+- publisher-loss/recovery semantics do not provide the ownership guarantees PGC needs
 
 These are not merely PowerShell bugs.
 
-### Target
+### Accepted architecture
 
 ```text
-PGC Host
-|- MediaMTX
-`- FFmpeg
+RTSP reader demand
+-> MediaMTX runOnDemand
+-> pgc-host-windows.exe --demand-signal
+-> held localhost connection to running Host
+-> Host starts/owns FFmpeg
+-> FFmpeg publishes SRT to MediaMTX
+-> MediaMTX serves RTSP reader
 ```
 
-instead of:
+The demand helper exists only to translate MediaMTX reader demand into a Host-visible signal. It does not own FFmpeg.
 
-```text
-PGC Host
-`- MediaMTX
-   `- PowerShell
-      `- FFmpeg
-```
+### Why this preserves the product model
+
+- arbitrary compatible RTSP readers can still create demand
+- no PGC Client -> Host session-control protocol is required
+- Host remains authoritative over encoder lifecycle
+- FFmpeg can restart while demand remains without requiring MediaMTX to relaunch the encoder
 
 ### Implication
 
-Do not spend significant engineering effort perfecting the PowerShell/PID-file bridge once native ownership is available.
+Do not return FFmpeg launch/stop ownership to MediaMTX scripts merely because `runOnDemand` still appears in the configuration. Its role is demand signaling only.
 
 ---
 
-## 2026-10 — PID files are not the long-term ownership model
+## 2026-10 — PID files and PowerShell are not the active ownership model
 
 ### Decision
 
-Native Host FFmpeg ownership must use direct child/process handles.
+Native Host FFmpeg ownership uses direct child/process handles.
+
+PowerShell start/stop scripts and PID-file ownership are legacy/deprecated.
 
 ### Rationale
 
@@ -326,9 +335,27 @@ Potential problems include:
 - start/stop ordering races
 - ownership ambiguity
 
+Direct Host process ownership is clearer and enables intentional restart, shutdown, and failure handling.
+
 ### Implication
 
-PID files may remain temporarily for diagnostics/rollback but should not define primary ownership.
+Legacy scripts may remain temporarily for archaeological/reference value, but active architecture must not silently drift back to them.
+
+---
+
+## 2026-10 — Host-owned child processes use Windows Job Object containment
+
+### Decision
+
+The Windows Host should assign MediaMTX and FFmpeg to a kill-on-close Windows Job Object on a best-effort basis.
+
+### Rationale
+
+If the Host is hard-killed, its child infrastructure should not remain orphaned and continue holding ports, capture hardware, or encoder resources.
+
+### Implication
+
+Job Object assignment failure may currently warn rather than fail Host startup, but hard-kill cleanup remains part of the Host regression matrix.
 
 ---
 
@@ -392,6 +419,7 @@ Logs should be visually scannable and never ambiguous about who produced a line.
 - no ANSI in redirected output
 - Debug may omit redundant `[PGC]`
 - Verbose always includes explicit provenance
+- explicit user actions and final state changes should be logged so the diagnostic history represents the UI's actual state
 
 ---
 
@@ -422,3 +450,32 @@ The project has grown beyond what should live only in conversational memory.
 ### Implication
 
 A milestone is not considered fully synchronized until its documentation impact has been reviewed.
+
+---
+
+## 2026-10 — Commit messages and code comments are archaeological documentation
+
+### Decision
+
+Commit messages and non-obvious code comments should be written for a future maintainer who may encounter the project years or decades later without access to the original conversation.
+
+### Rationale
+
+History is most valuable when it explains what changed, why it changed, what it replaced, and which constraints motivated the choice.
+
+Opaque shorthand such as "stabilize lifecycle" loses value over time.
+
+A better commit subject names the architectural transition directly, for example:
+
+```text
+Replace MediaMTX/PowerShell FFmpeg lifecycle with native Host control and strengthen client recovery
+```
+
+### Implications
+
+Future cleanup should:
+
+- comment rationale, invariants, workarounds, and platform quirks where they are not obvious
+- avoid comments that merely restate syntax
+- keep comments current as architecture changes
+- write commit subjects/bodies that can reconstruct intent without conversational context
