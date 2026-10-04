@@ -424,6 +424,56 @@ Implementation:
   - from `version=1`
   - toward explicit `protocol_version=1`
 
+The first complete pass of the versioning system is a candidate milestone for the first `master` -> `main` pull request.
+
+---
+
+## GitHub Releases / distribution pipeline
+
+**Status: Planned — begin manually, automate after conventions are proven**
+
+GitHub Releases should become the normal public distribution surface for precompiled PGC builds once versioning and packaging are ready.
+
+Initial/manual phase:
+
+- create releases by hand to learn the desired workflow
+- prepare platform packages manually at first
+- attach precompiled Host/Client artifacts
+- establish artifact naming conventions
+- establish release-note structure
+- establish checksum/signing expectations where appropriate
+- verify how independent Host/Client SemVer should map to tags and release pages before locking in automation
+
+Release intent:
+
+- published builds should have passed hands-on baseline functionality and stability testing
+- SemVer maturity should align with GitHub prerelease/full-release intent
+- alpha/beta/otherwise unstable milestones should be GitHub prereleases
+- stable public versions should use normal GitHub releases
+- do not publish every development commit as a release
+
+Future GitHub Actions automation:
+
+- build all supported target-platform artifacts
+- run appropriate automated tests/checks per platform
+- package executables/apps and required runtime files
+- generate checksums and other release metadata
+- create or populate GitHub Releases
+- upload release assets automatically
+- scale the matrix as Windows, macOS, Linux, Steam Deck, mobile, and other supported platforms are added
+
+Desired long-term shape:
+
+```text
+validated version/tag
+-> GitHub Actions matrix
+-> build/test/package each supported platform
+-> create release assets
+-> publish GitHub prerelease/release
+```
+
+Do not automate release/tag structure until the first manual releases establish what users and maintainers actually need.
+
 ---
 
 ## Packaging / installation
@@ -446,6 +496,8 @@ Installer/package should eventually handle:
 ### macOS
 
 Eventually remove Homebrew as a hard runtime dependency where licensing/distribution permits by bundling or managing playback dependencies.
+
+Packaging work should converge with the GitHub Releases/Actions pipeline so release artifacts are reproducible rather than hand-assembled indefinitely.
 
 ---
 
@@ -569,11 +621,44 @@ Repository docs are canonical shared project memory.
 
 Workflow:
 
-- decisions recorded in DECISIONS
-- roadmap state maintained continuously
+- decisions recorded in DECISIONS when durable
+- roadmap state maintained continuously enough to remain useful
 - implementation reports flag documentation impact
-- architecture/dev notes updated after approved milestones
-- code and documentation preferably committed together
+- documentation updates may be consolidated across several tickets within one working branch
+- accepted feature branches receive a documentation reconciliation before merge into `master`
+- `master` receives a broader documentation/release review before milestone merges into `main`
+- code and documentation should be committed together when practical
+
+---
+
+## Branch / integration workflow
+
+**Status: Active**
+
+Current intended branch roles:
+
+- `main`: stable milestone/release baseline
+- `master`: integrated, hands-on accepted development state
+- short-lived `feature/*`, `fix/*`, `refactor/*`, and `spike/*` branches: active work
+
+Working branches may contain frequent commits and iterative/destructive changes. Once a feature set is accepted:
+
+```text
+working branch
+-> documentation sync
+-> merge/PR into master
+-> delete working branch
+```
+
+At larger stable milestones:
+
+```text
+master
+-> project-level review
+-> PR into main
+```
+
+The first completed versioning pass is a candidate for the first substantial `master` -> `main` milestone.
 
 ---
 
