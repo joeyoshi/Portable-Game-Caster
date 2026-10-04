@@ -440,16 +440,19 @@ Repository documentation is the shared reference point for:
 2. Experimental code does not automatically become architecture.
 3. Every coding report assesses documentation impact.
 4. Approved implementation updates Architecture and Dev Notes.
-5. Roadmap reflects priority/status continuously.
-6. Prefer committing accepted code and documentation together.
+5. Roadmap reflects priority/status continuously enough to remain useful.
+6. Documentation updates may be consolidated across several implementation tickets and synchronized at meaningful branch/milestone checkpoints.
+7. Prefer committing accepted code and documentation together when practical.
 
 ### Rationale
 
 The project has grown beyond what should live only in conversational memory.
 
+Updating every canonical document after every small ticket would create unnecessary churn, while waiting too long risks divergence.
+
 ### Implication
 
-A milestone is not considered fully synchronized until its documentation impact has been reviewed.
+A milestone is not considered fully synchronized until its documentation impact has been reviewed. Accepted working branches should receive a documentation reconciliation before merge into `master`, and `master` should receive a broader project-level review before milestone merges into `main`.
 
 ---
 
@@ -479,3 +482,49 @@ Future cleanup should:
 - avoid comments that merely restate syntax
 - keep comments current as architecture changes
 - write commit subjects/bodies that can reconstruct intent without conversational context
+
+---
+
+## 2026-10 — Development uses short-lived working branches, master integration, and main milestones
+
+### Decision
+
+PGC uses three conceptual levels of Git history:
+
+```text
+main
+  stable milestone / release baseline
+
+master
+  integrated development state
+
+feature/*, fix/*, refactor/*, spike/*
+  short-lived working branches
+```
+
+### Rationale
+
+Frequent commits are valuable safety checkpoints during active development, but `master` should represent accepted integrated work and `main` should remain a meaningful stable baseline rather than tracking every implementation churn.
+
+Short-lived branches let a coherent feature set undergo iterative, destructive, or experimental work without making the integration branches hard to interpret.
+
+Branch names and merge/PR history also provide durable archaeological context for where a feature came from.
+
+### Workflow implications
+
+- branch new feature/fix/refactor/spike work from `master`
+- commit frequently inside the working branch
+- hands-on test and accept the feature set before integration
+- reconcile relevant documentation before merging into `master`
+- merge through a PR or explicit merge when that improves the historical record
+- delete completed working branches after merge so the active branch list stays clean
+- allow `master` to accumulate multiple accepted feature sets before promoting a larger milestone to `main`
+- use a PR for `master` -> `main` milestone promotion so the milestone has a durable high-level summary
+
+### Current milestone intent
+
+The first complete versioning-system pass is a candidate checkpoint for the first substantial `master` -> `main` pull request.
+
+### Important non-decision
+
+The exact GitHub Release tag scheme, whether Host and Client receive separate release pages, and the exact GitHub Actions trigger/build matrix are not yet locked. Those remain roadmap items until manual releases and the versioning implementation establish the right conventions.
