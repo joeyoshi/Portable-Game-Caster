@@ -41,7 +41,7 @@ PGC is a broadcast/listener architecture.
 
 Clients consume a stream. They do not tightly own Host sessions.
 
-Client-side Cancel or Stop Stream should remain local Client actions rather than sending session-control commands to the Host.
+Client-side Cancel or Stop Stream are local Client actions rather than Host session-control commands.
 
 ### Demand-driven Host
 
@@ -65,9 +65,11 @@ Low idle resource use is more important than instant first-frame startup.
 
 ### Process ownership
 
-MediaMTX is relay/service infrastructure.
+The native Windows Host owns FFmpeg lifecycle.
 
-The native Host should own:
+MediaMTX is relay and demand-detection infrastructure; it does not own the encoder process.
+
+The Host owns:
 
 - FFmpeg launch
 - FFmpeg process lifetime
@@ -75,8 +77,6 @@ The native Host should own:
 - FFmpeg stop
 - capture/encoder health
 - cleanup on Host shutdown
-
-MediaMTX should not be the long-term owner of FFmpeg lifecycle.
 
 ## 3. Media data path
 
@@ -96,7 +96,7 @@ Windows FFmpeg
         v
 MediaMTX
         |
-        | RTSP/TCP LAN
+        | RTSP/TCP over LAN
         v
 PGC Client
         |
@@ -107,13 +107,11 @@ ffplay / future native player layer
 Discord share / local viewing
 ```
 
-The media topology remains valid while FFmpeg process ownership moves from MediaMTX/PowerShell to the Rust Host.
-
 ## 4. Windows Host
 
 ### 4.1 Responsibilities
 
-The Windows Host currently owns or is expected to own:
+The Windows Host currently owns:
 
 - MediaMTX process supervision
 - mDNS advertisement
@@ -124,6 +122,7 @@ The Windows Host currently owns or is expected to own:
 - recovery
 - shutdown cleanup
 - diagnostics
+- Windows Job Object containment for child infrastructure
 
 Future responsibilities include:
 
@@ -150,32 +149,43 @@ It represents the singleton contract and should only change intentionally if PGC
 
 Multiple PGC Hosts on the LAN are valid.
 
-### 4.3 Native FFmpeg ownership transition
+### 4.3 Native FFmpeg ownership
 
-Current committed implementation may still contain the transitional:
-
-```text
-MediaMTX
--> runOnDemand
--> PowerShell
--> FFmpeg
-```
-
-bridge.
-
-Approved target:
+Current architecture:
 
 ```text
 PGC Host
-|- MediaMTX
-|- FFmpeg
-|- demand interpretation
+|- MediaMTX supervisor
+|- native FFmpeg owner
+|- demand listener
+|- --demand-signal helper mode
+|- Windows Job Object
 |- mDNS
 |- recovery
 `- lifecycle
 ```
 
-Native Host ownership requirements:
+MediaMTX `runOnDemand` launches:
+
+```text
+pgc-host-windows.exe --demand-signal
+```
+
+The helper connects to the running Host over localhost and holds that TCP connection open.
+
+```text
+helper connection open
+= reader demand exists
+
+helper connection closes
+= that demand signal ended
+```
+
+This preserves the useful property that any compatible RTSP reader can create demand without requiring PGC-specific Client session commands.
+
+The helper is not the encoder owner. The already-running Host remains authoritative.
+
+Native Host ownership rules:
 
 - Host directly launches FFmpeg.
 - Host retains the child/process handle.
@@ -185,48 +195,76 @@ Native Host ownership requirements:
 - Host stops FFmpeg when demand ends.
 - Host shutdown confirms FFmpeg and MediaMTX are gone.
 - PID files are not the primary ownership model.
+- PowerShell start/stop scripts are legacy/deprecated and are not part of the active lifecycle.
 
 ### 4.4 Demand lifecycle
 
-Desired behavior:
+Current behavior:
 
 ```text
 no viewers
 -> no FFmpeg
 
 first viewer demand
+-> MediaMTX starts --demand-signal helper
+-> Host receives demand
 -> Host launches FFmpeg
 -> FFmpeg opens capture
 -> FFmpeg publishes SRT
 -> MediaMTX exposes stream
 -> Client confirms media
 -> Playing
+```
 
+Current teardown:
+
+```text
 last viewer leaves
--> short intentional grace
--> Host stops FFmpeg
+-> MediaMTX waits 10s runOnDemandCloseAfter
+-> demand helper exits
+-> Host sees demand inactive
+-> Host waits 5s encoder grace
+-> Host sends q to FFmpeg
+-> FFmpeg exits gracefully when possible
 -> capture/NVENC return idle
 ```
 
-Recovery:
+Normal last-reader-to-idle time is therefore approximately 15 seconds plus graceful FFmpeg shutdown time.
+
+FFmpeg recovery:
 
 ```text
 FFmpeg fails while demand exists
 -> Host notices exit
+-> Host backs off briefly
 -> Host relaunches FFmpeg
 -> MediaMTX receives new publisher
 -> Client recovery continues
 ```
+
+Current restart backoff is 1s, then 2s, then 5s, with reset after a healthy run of approximately 10 seconds.
 
 MediaMTX failure:
 
 ```text
 MediaMTX fails
 -> Host detects exit
--> Host restores clean relay state
+-> Host clears all demand signals
+-> Host stops and confirms FFmpeg
 -> Host restarts MediaMTX
--> demand/publisher lifecycle resumes without stale processes
+-> no encoder runs until fresh reader demand exists
 ```
+
+### 4.5 Job Object containment
+
+The Host creates a Windows Job Object configured for kill-on-close and assigns MediaMTX and FFmpeg to it on a best-effort basis.
+
+Purpose:
+
+- hard-killing the Host should also terminate owned child infrastructure
+- shutdown should not leave encoder/relay orphans
+
+Failure to assign a child to the Job Object is currently treated as a warning rather than a Host startup failure.
 
 ## 5. Capture prototype
 
@@ -308,37 +346,33 @@ Client reader:
 rtsp://<host>:8554/gameplay
 ```
 
-Current timing:
+Current relevant settings:
 
 ```text
 readTimeout: 2s
 writeTimeout: 10s
-```
-
-### Transitional runOnDemand behavior
-
-The old bridge also uses:
-
-```text
-runOnDemandRestart: true
+runOnDemand: $PGC_HOST_EXE --demand-signal
+runOnDemandRestart: false
 runOnDemandStartTimeout: 15s
-runOnDemandCloseAfter: 5s
+runOnDemandCloseAfter: 10s
 ```
+
+There is no active `runOnUnDemand` script.
+
+### 7.1 MediaMTX demand semantics
 
 MediaMTX 1.21.1 source was inspected during recovery debugging.
 
-Verified behavior:
+Important verified behavior:
 
-- Windows external commands use a kill-on-close Job Object.
-- Stopping runOnDemand terminates its PowerShell/FFmpeg command tree.
-- Killing MediaMTX also closes that Job Object.
-- runOnDemand restart uses a fixed approximately five-second pause.
-- publisher loss does not reset the current on-demand state
 - a DESCRIBE waiting for a source does not count as an active reader
-- close-after can expire while the Client is still waiting for recovery
-- start-timeout applies to a new command-start cycle
+- publisher loss does not itself reset all on-demand state
+- close-after can expire while a Client is still waiting for recovery
+- therefore MediaMTX's internal demand model is not sufficient to own encoder recovery semantics
 
-This mismatch between MediaMTX demand semantics and PGC Client recovery semantics is why MediaMTX-owned FFmpeg is being retired.
+The current architecture keeps MediaMTX responsible only for starting/stopping the lightweight demand helper. The Host owns FFmpeg recovery while the helper remains connected.
+
+If real-world FFmpeg recovery ever regularly exceeds the current MediaMTX close-after window, the preferred follow-up is for the Host to consult MediaMTX reader state/control API before treating demand as truly gone. Returning FFmpeg lifecycle ownership to MediaMTX is not the preferred solution.
 
 ## 8. Discovery
 
@@ -421,16 +455,11 @@ or:
 
 Definitions:
 
-- `Connecting`
-  - establishing host/service handshake
-- `WaitingForStream`
-  - host/service is reachable but media is not yet confirmed
-- `Playing`
-  - decoded media is confirmed
-- `ReconnectingStream`
-  - playback was previously healthy and stream connectivity has been lost
-- `ReconnectingHost`
-  - previously connected Host is no longer discoverable/reachable
+- `Connecting`: establishing host/service handshake
+- `WaitingForStream`: host/service is reachable but media is not yet confirmed
+- `Playing`: decoded media is confirmed
+- `ReconnectingStream`: playback was previously healthy and stream connectivity has been lost
+- `ReconnectingHost`: previously connected Host is no longer discoverable/reachable
 
 Fresh connections never use reconnect states.
 
@@ -496,9 +525,7 @@ Playing = confirmed decoded media flow
 
 After MediaStarted, the Client compares ffplay status information excluding the `-sync ext` master-clock column.
 
-Reason:
-
-The master clock continues advancing during a frozen stream.
+The master clock continues advancing during a frozen stream and is therefore not itself a liveness signal.
 
 Current stall behavior:
 
@@ -579,6 +606,7 @@ Rules:
 - Verbose always identifies source
 - redirected output is plain text
 - terminal styling is centralized
+- explicit user actions and final state transitions should be logged so diagnostic history matches observable UI state
 
 Long-term possibility:
 
