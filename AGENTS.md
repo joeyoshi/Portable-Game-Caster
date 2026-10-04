@@ -29,7 +29,7 @@ Portable Game Caster (PGC) is a free/open-source local-network console gameplay 
 10. Preserve platform-native behavior where practical; share core logic rather than forcing a lowest-common-denominator UI.
 11. Prefer one portable app per role with runtime flags/settings over separate debug/release application variants.
 12. PGC is a broadcast/listener system. Clients should not tightly own Host sessions.
-13. MediaMTX is relay/service infrastructure. The native Host should own capture/encoder lifecycle.
+13. MediaMTX is relay/demand infrastructure. The native Host owns FFmpeg/capture lifecycle.
 
 ## Agent working contract
 
@@ -107,35 +107,25 @@ Do not automatically rewrite canonical docs during every coding ticket unless th
 
 The repository docs are shared project memory for the user, ChatGPT, and coding agents.
 
-Use this flow:
-
 1. Product/architecture decisions may be recorded in ROADMAP and DECISIONS immediately.
 2. Experimental implementation does not automatically become architectural truth.
-3. Claude/coding agents flag documentation impact in every report.
+3. Coding agents flag documentation impact in every report.
 4. After hands-on validation/approval, synchronize ARCHITECTURE and DEV-NOTES to accepted behavior.
 5. Prefer committing accepted code and its documentation sync together.
 6. When a milestone is declared approved or ready to commit, check documentation before considering the checkpoint complete.
 
 ### Document responsibilities
 
-- `AGENTS.md`
-  - agent operating rules and workflow contract
-- `PGC-ARCHITECTURE.md`
-  - current accepted architecture plus clearly marked active transitions
-- `PGC-ROADMAP.md`
-  - prioritized future work and milestone status
-- `PGC-DEV-NOTES.md`
-  - implementation constraints, experiments, landmines, and platform-specific knowledge
-- `PGC-DECISIONS.md`
-  - durable product/architecture decisions and their rationale
-- `PGC-VERSIONING.md`
-  - product/protocol/build version policy
+- `AGENTS.md`: agent operating rules and workflow contract
+- `docs/PGC-ARCHITECTURE.md`: current accepted architecture plus clearly marked active transitions
+- `docs/PGC-ROADMAP.md`: prioritized future work and milestone status
+- `docs/PGC-DEV-NOTES.md`: implementation constraints, experiments, landmines, and platform-specific knowledge
+- `docs/PGC-DECISIONS.md`: durable product/architecture decisions and their rationale
+- `docs/PGC-VERSIONING.md`: product/protocol/build version policy
 
 ## Logging modes
 
 Client already supports runtime logging modes. Host parity is a near-term roadmap item.
-
-Shared target semantics:
 
 ### Normal
 
@@ -146,13 +136,13 @@ Shared target semantics:
 
 ### Debug
 
-- everything useful for structured PGC diagnostics
+- structured PGC diagnostics
 - state/lifecycle reasoning
 - discovery and connection decisions
 - health/recovery events
 - process ownership events
-- event-driven, not a raw per-frame/per-packet feed
-- should remain practical for troubleshooting without major performance cost
+- event-driven rather than a raw per-frame/per-packet feed
+- practical for troubleshooting without major performance cost
 
 ### Verbose
 
@@ -162,8 +152,6 @@ Shared target semantics:
 - every line must make its source unambiguous
 
 ## Logging presentation direction
-
-Shared target layout:
 
 ```text
 Debug:
@@ -185,27 +173,15 @@ Rules:
 - message text begins at one consistent column
 - category colours are stable and consistent
 - categories shared by Host and Client should use the same colour
-- Debug may omit redundant `[PGC]` source identity when all visible lines are PGC-native
+- Debug may omit redundant `[PGC]` when all visible lines are PGC-native
 - Verbose requires explicit source identity on every line
 - raw/external output must never be ambiguous about its source
 - terminal colour is presentation-only
-- redirected/file output should remain clean plain text unless colour is explicitly forced
+- redirected/file output remains clean plain text unless colour is explicitly forced
 - centralize formatting/styling rather than scattering ANSI codes through call sites
+- explicit user actions and final state changes should leave concise breadcrumbs; a log should not end at `Playing` when the UI has returned to Idle
 
-Potential PGC categories include:
-
-- `APP`
-- `STATE`
-- `CONNECT`
-- `DISCOVERY`
-- `PLAYER`
-- `STREAM`
-- `HEALTH`
-- `RECONNECT`
-- `HOST`
-- `CAPTURE`
-- `ENCODER`
-- `DEMAND`
+Potential PGC categories include `APP`, `STATE`, `ACTION`, `CONNECT`, `DISCOVERY`, `PLAYER`, `STREAM`, `HEALTH`, `RECONNECT`, `HOST`, `CAPTURE`, `ENCODER`, and `DEMAND`.
 
 ## Current macOS logging behavior
 
@@ -246,8 +222,6 @@ Rules:
 
 ## Current stream topology
 
-Accepted media topology:
-
 ```text
 Console / AVR / capture device
 -> Windows FFmpeg
@@ -258,49 +232,54 @@ Console / AVR / capture device
 -> Discord
 ```
 
-Host-side FFmpeg ownership is actively transitioning from MediaMTX/PowerShell `runOnDemand` ownership to native Rust Host ownership.
+FFmpeg lifecycle is owned natively by the Windows Host. MediaMTX `runOnDemand` is used only to launch a lightweight `pgc-host-windows.exe --demand-signal` helper that holds a localhost connection to the running Host. That connection represents reader demand; the Host decides whether FFmpeg should run.
 
-Until that work is hands-on validated:
+PowerShell start/stop scripts and PID-file ownership are legacy/deprecated and must not be reintroduced into the active lifecycle without an explicit architecture decision.
 
-- PowerShell/runOnDemand remains the current implementation.
-- Native Host ownership is the approved target architecture.
+## Windows Host lifecycle
 
-## Windows Host lifecycle direction
-
-Approved target:
+Current architecture:
 
 ```text
 PGC Host
 |- MediaMTX supervisor
 |- native FFmpeg owner
-|- demand-state interpretation
+|- demand listener / helper mode
+|- Windows Job Object containment
 |- mDNS advertisement
 |- recovery/lifecycle logic
 `- future configuration / capture portability
 ```
 
-The Host should:
+The Host:
 
-- start idle with no FFmpeg
-- detect demand
-- launch FFmpeg directly
-- retain the FFmpeg process handle
-- guarantee at most one owned FFmpeg
-- monitor expected/unexpected exit
-- restart FFmpeg while demand remains
-- stop FFmpeg when demand ends
-- cleanly stop FFmpeg and MediaMTX on Host shutdown
-- avoid PID files as the primary ownership mechanism
+- starts idle with no FFmpeg
+- listens for localhost demand-signal connections
+- launches FFmpeg directly when demand becomes active
+- retains the FFmpeg process handle
+- guarantees at most one owned FFmpeg
+- restarts FFmpeg after unexpected exit while demand remains
+- stops FFmpeg after demand ends and its grace period expires
+- stops/cleans FFmpeg if MediaMTX exits
+- cleanly stops FFmpeg and MediaMTX on Host shutdown
+- assigns MediaMTX and FFmpeg to a kill-on-close Windows Job Object on a best-effort basis
+- does not use a PID file as the primary ownership mechanism
+
+Current demand timing:
+
+- MediaMTX `runOnDemandCloseAfter`: 10s
+- Host no-demand FFmpeg grace: 5s
+- normal last-reader-to-idle teardown is therefore approximately 15s plus graceful FFmpeg exit time
+
+Current basic Windows hands-on validation passed. Broader stress/recovery testing remains useful but is not required to treat native Host ownership as the accepted architecture.
 
 ## Known Windows media constraints
 
 - Current FFmpeg: Gyan 8.0.1 full build.
 - Do not casually upgrade it.
 - Newer tested builds require NVENC API/driver support unavailable on the current GTX 1080 Ti system.
-- DirectShow video:
-  - `Game Capture HD60 S+`
-- DirectShow audio:
-  - `Digital Audio Interface (Game Capture HD60 S+)`
+- DirectShow video: `Game Capture HD60 S+`
+- DirectShow audio: `Digital Audio Interface (Game Capture HD60 S+)`
 - Capture is YUY2 1920x1080@60 and must be converted to NV12 before Pascal NVENC.
 - Do not use `-use_wallclock_as_timestamps 1`.
 - `-repeat_headers 1` is unsupported in the current h264_nvenc build.
@@ -312,11 +291,7 @@ The Host should:
 
 Current MediaMTX version: `1.21.1`.
 
-Current path:
-
-```text
-/gameplay
-```
+Current path: `/gameplay`
 
 SRT publisher:
 
@@ -332,47 +307,41 @@ port 8554
 /gameplay
 ```
 
-Current transitional bridge includes:
+Current relevant settings:
 
 - `readTimeout: 2s`
 - `writeTimeout: 10s`
-- `runOnDemandRestart: true`
+- `runOnDemand: $PGC_HOST_EXE --demand-signal`
+- `runOnDemandRestart: false`
 - `runOnDemandStartTimeout: 15s`
-- `runOnDemandCloseAfter: 5s`
+- `runOnDemandCloseAfter: 10s`
+- no active `runOnUnDemand` script
 
-Verified from MediaMTX 1.21.1 source:
+Verified MediaMTX 1.21.1 semantics remain important:
 
 - waiting DESCRIBE requests are not counted as active readers
-- publisher loss can leave a Client still attempting recovery while MediaMTX considers no reader active
-- runOnDemand restart uses a fixed ~5 second restart pause
-- this can collide with the current 5 second close-after timing
-- Windows external commands are owned by a kill-on-close Job Object
-- stopping/killing MediaMTX normally terminates its PowerShell/FFmpeg runOnDemand command tree
-
-These semantics are a primary reason to remove FFmpeg lifecycle ownership from MediaMTX.
+- publisher loss can leave a Client attempting recovery while MediaMTX considers no reader active
+- the native Host therefore owns FFmpeg restart while the demand helper remains alive
+- if FFmpeg recovery ever exceeds the MediaMTX close-after window in real use, reader-count/API-based demand confirmation is the preferred follow-up rather than returning lifecycle ownership to MediaMTX
 
 ## Windows Host singleton
 
 Only one PGC Host should run per Windows machine.
 
-Current mutex:
-
 ```text
 Global\PortableGameCasterHost.v1
 ```
 
-Rules:
-
-- mutex is acquired before other Host-owned resources
+- acquired before other Host-owned resources
 - second launch exits cleanly
-- `ERROR_ACCESS_DENIED` may be treated as an existing instance across privilege/account contexts
+- `ERROR_ACCESS_DENIED` may represent an existing instance across privilege/account contexts
 - mutex name represents the invariant one-Host-per-machine contract
 - do not casually rev `.v1` with application SemVer
 - multiple PGC Hosts on one LAN remain valid
 
 ## macOS player notes
 
-Known-good ffplay options include:
+Known-good ffplay options:
 
 ```text
 -rtsp_transport tcp
@@ -404,8 +373,6 @@ Known follow-ups:
 - detect ffplay itself ceasing to emit status entirely
 - distinguish video progress from audio progress so audio cannot mask a frozen video stream
 
-Do not over-engineer these until scheduled.
-
 ## Discovery protocol
 
 Service:
@@ -422,9 +389,7 @@ path=/gameplay
 version=1
 ```
 
-Protocol compatibility must remain independent from Host and Client SemVer.
-
-Future metadata should use an explicitly named protocol-version field.
+Protocol compatibility must remain independent from Host and Client SemVer. Future metadata should use an explicitly named protocol-version field.
 
 ## Versioning policy
 
@@ -445,26 +410,18 @@ Platform-specific build numbers may differ while sharing product SemVer when fea
 - Prefer responsibility-based modules over large monolithic files.
 - Keep reconnect logic separate from UI rendering.
 - Preserve exhaustive state handling.
-- Explicit user actions that change state should eventually have concise Debug breadcrumbs.
+- Explicit user actions that change state should have concise Debug breadcrumbs.
 
 ## Current macOS module direction
 
-- `discovery.rs`
-  - mDNS discovery and same-host rediscovery
-- `player.rs`
-  - ffplay location, launch, stderr/health parsing, transport events, stream metadata
-- `state.rs`
-  - user-facing state model
-- `logging.rs`
-  - runtime logging configuration and formatting
-- `ui.rs` / future `ui/`
-  - AppKit lifecycle and rendering
-- `worker/mod.rs`
-  - high-level stream lifecycle
-- `worker/reconnect.rs`
-  - same-host reconnect/handshake recovery
-- `worker/countdown.rs`
-  - monotonic deadline-driven countdown ticker
+- `discovery.rs`: mDNS discovery and same-host rediscovery
+- `player.rs`: ffplay location, launch, stderr/health parsing, transport events, stream metadata
+- `state.rs`: user-facing state model
+- `logging.rs`: runtime logging configuration and formatting
+- `ui.rs` / future `ui/`: AppKit lifecycle and rendering
+- `worker/mod.rs`: high-level stream lifecycle
+- `worker/reconnect.rs`: same-host reconnect/handshake recovery
+- `worker/countdown.rs`: monotonic deadline-driven countdown ticker
 
 ## Do not regress
 
@@ -476,3 +433,4 @@ Platform-specific build numbers may differ while sharing product SemVer when fea
 - Normal app UX must remain usable without a terminal.
 - Playing must never remain indefinitely true solely because ffplay/RTSP stayed open after media froze.
 - Idle Host behavior must not regress into an always-on capture/encode stream.
+- MediaMTX must not regain ownership of FFmpeg lifecycle through scripts or PID files by accident.
