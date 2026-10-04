@@ -1,5 +1,9 @@
 use std::fmt;
-use std::io::{self, IsTerminal};
+use std::io::{
+    self,
+    IsTerminal,
+};
+use std::path::Path;
 use std::sync::atomic::{
     AtomicU8,
     Ordering,
@@ -36,41 +40,78 @@ static LOG_LEVEL: AtomicU8 =
 
 
 // -----------------------------------------------------------------------------
-// Startup argument parsing
+// Startup configuration
 //
-// no flag     → Off
-// --debug     → Debug
-// --verbose   → Trace
+// Packaged .app:
+//     no flags    → Off
 //
-// --verbose implies --debug.
+// Raw Cargo-built executable:
+//     no flags    → Debug
+//
+// Explicit overrides:
+//     --quiet     → Off
+//     --debug     → Debug
+//     --verbose   → Trace
+//
+// --verbose has highest priority.
 // -----------------------------------------------------------------------------
 
 pub fn init_from_args() {
-    let mut level =
-        LogLevel::Off;
+    let arguments:
+        Vec<String> =
+            std::env::args()
+                .skip(1)
+                .collect();
 
 
-    for argument in
-        std::env::args().skip(1)
-    {
-        match argument.as_str() {
-            "--debug" => {
-                if level < LogLevel::Debug {
-                    level =
-                        LogLevel::Debug;
+    let explicit_verbose =
+        arguments
+            .iter()
+            .any(
+                |argument| {
+                    argument == "--verbose"
                 }
-            }
+            );
 
 
-            "--verbose" => {
-                level =
-                    LogLevel::Trace;
-            }
+    let explicit_debug =
+        arguments
+            .iter()
+            .any(
+                |argument| {
+                    argument == "--debug"
+                }
+            );
 
 
-            _ => {}
-        }
-    }
+    let explicit_quiet =
+        arguments
+            .iter()
+            .any(
+                |argument| {
+                    argument == "--quiet"
+                }
+            );
+
+
+    let default_level =
+        if running_from_app_bundle() {
+            LogLevel::Off
+        } else {
+            LogLevel::Debug
+        };
+
+
+    let level =
+        if explicit_verbose {
+            LogLevel::Trace
+        } else if explicit_debug {
+            LogLevel::Debug
+        } else if explicit_quiet {
+            LogLevel::Off
+        } else {
+            default_level
+        };
 
 
     LOG_LEVEL.store(
@@ -86,7 +127,56 @@ pub fn init_from_args() {
                 "Portable Game Caster diagnostics enabled ({level:?})"
             ),
         );
+
+
+        if running_from_app_bundle() {
+            debug(
+                "APP",
+                format_args!(
+                    "Runtime: packaged macOS app"
+                ),
+            );
+        } else {
+            debug(
+                "APP",
+                format_args!(
+                    "Runtime: development executable"
+                ),
+            );
+        }
     }
+}
+
+
+// -----------------------------------------------------------------------------
+// Determine whether this executable lives inside a .app bundle
+// -----------------------------------------------------------------------------
+
+fn running_from_app_bundle() -> bool {
+    let Ok(executable) =
+        std::env::current_exe()
+    else {
+        return false;
+    };
+
+
+    path_is_inside_app_bundle(
+        &executable
+    )
+}
+
+
+fn path_is_inside_app_bundle(
+    path: &Path,
+) -> bool {
+    let path_text =
+        path
+            .to_string_lossy();
+
+
+    path_text.contains(
+        ".app/Contents/MacOS/"
+    )
 }
 
 
@@ -99,19 +189,23 @@ pub fn level() -> LogLevel {
         Ordering::Relaxed
     ) {
         2 => LogLevel::Trace,
+
         1 => LogLevel::Debug,
+
         _ => LogLevel::Off,
     }
 }
 
 
 pub fn debug_enabled() -> bool {
-    level() >= LogLevel::Debug
+    level()
+        >= LogLevel::Debug
 }
 
 
 pub fn trace_enabled() -> bool {
-    level() >= LogLevel::Trace
+    level()
+        >= LogLevel::Trace
 }
 
 
@@ -126,6 +220,7 @@ pub fn debug(
     if !debug_enabled() {
         return;
     }
+
 
     print_log(
         category,
@@ -143,6 +238,7 @@ pub fn trace(
         return;
     }
 
+
     print_log(
         category,
         args,
@@ -153,8 +249,6 @@ pub fn trace(
 
 // -----------------------------------------------------------------------------
 // State logging
-//
-// This should be called whenever a state is sent to AppKit.
 // -----------------------------------------------------------------------------
 
 pub fn state(
@@ -184,11 +278,12 @@ fn print_log(
     args: fmt::Arguments<'_>,
     is_trace: bool,
 ) {
-    let stderr_is_terminal =
-        io::stderr().is_terminal();
+    let terminal =
+        io::stderr()
+            .is_terminal();
 
 
-    if stderr_is_terminal {
+    if terminal {
         if is_trace {
             eprintln!(
                 "\x1b[90m[PGC][{category}]\x1b[0m {args}"
