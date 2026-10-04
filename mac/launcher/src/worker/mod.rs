@@ -3,7 +3,6 @@ mod reconnect;
 use std::process::Child;
 use std::sync::{
     mpsc::{
-        Receiver,
         Sender,
         TryRecvError,
     },
