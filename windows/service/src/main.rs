@@ -1,3 +1,5 @@
+mod instance;
+
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 
 use std::env;
@@ -31,6 +33,28 @@ const PROTOCOL_VERSION: &str = "1";
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Portable Game Caster - Windows Host");
     println!("-----------------------------------");
+
+
+    let _instance_guard =
+        match instance::acquire()? {
+            Some(guard) => {
+                guard
+            }
+
+
+            None => {
+                println!(
+                    "Portable Game Caster Host is already running."
+                );
+
+                eprintln!(
+                    "[PGC][DEBUG] Rejected second Windows Host startup because another instance owns the machine-wide mutex."
+                );
+
+
+                return Ok(());
+            }
+        };
 
     let running =
         Arc::new(AtomicBool::new(true));
