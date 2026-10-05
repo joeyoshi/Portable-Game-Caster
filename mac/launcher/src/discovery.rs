@@ -77,7 +77,7 @@ pub fn discover_stream(
     logging::debug(
         "DISCOVERY",
         format_args!(
-            "Starting PGC host discovery"
+            "Starting Portable Game Caster host discovery"
         ),
     );
 
@@ -99,7 +99,7 @@ pub fn discover_stream(
             logging::debug(
                 "DISCOVERY",
                 format_args!(
-                    "No PGC host discovered before timeout"
+                    "No Portable Game Caster host discovered before timeout"
                 ),
             );
 
@@ -561,7 +561,7 @@ fn discover_matching(
         logging::debug(
             "DISCOVERY",
             format_args!(
-                "PGC service was seen, but its network address did not resolve before timeout"
+                "Portable Game Caster service was seen, but its network address did not resolve before timeout"
             ),
         );
 
