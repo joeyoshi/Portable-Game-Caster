@@ -1,108 +1,40 @@
 # Portable Game Caster Development Notes
 
-This file contains implementation knowledge, tested constraints, failed experiments, and technical landmines that should not need to be rediscovered.
+Implementation knowledge, tested constraints, failed experiments, and technical landmines that should not need to be rediscovered.
 
-## Windows FFmpeg pin
+## Windows FFmpeg / capture constraints
 
-Current prototype Host uses:
+Current prototype Host uses **Gyan FFmpeg 8.0.1 full**. Do not casually upgrade it: newer tested builds required NVENC API 13.1 / driver >= 610 while the current GTX 1080 Ti / Pascal system exposes API 13.0.
 
-```text
-Gyan FFmpeg 8.0.1 full build
-```
-
-Reason:
-
-Newer tested builds required NVENC API 13.1 / driver >= 610.
-
-The current GTX 1080 Ti / Pascal system exposes NVENC API 13.0.
-
-Do not casually upgrade FFmpeg without retesting Pascal compatibility.
-
-## Capture inputs
-
-DirectShow video:
+Current DirectShow inputs:
 
 ```text
-Game Capture HD60 S+
-```
-
-DirectShow audio:
-
-```text
-Digital Audio Interface (Game Capture HD60 S+)
+video: Game Capture HD60 S+
+audio: Digital Audio Interface (Game Capture HD60 S+)
 ```
 
 Observed input:
 
-- video:
-  - YUY2 / yuyv422
-  - 1920x1080
-  - 60 fps
-- audio:
-  - PCM s16le
-  - 44.1 kHz
-  - stereo
+- YUY2 / yuyv422, 1920x1080 @ 60 fps
+- PCM s16le, 44.1 kHz, stereo
 
-Pascal NVENC cannot directly ingest the current YUY2/4:2:2 input.
+Pascal NVENC cannot directly ingest the current YUY2/4:2:2 input. Convert to NV12 first.
 
-Convert to NV12 first.
+Current encode characteristics to preserve unless intentionally retuning:
 
-## Current FFmpeg behavior to preserve
-
-Do not use:
-
-```text
--use_wallclock_as_timestamps 1
-```
-
-It produced non-monotonic DTS behavior.
-
-Current audio approach:
-
-```text
-aresample=48000:async=1000:first_pts=0
-```
-
-Current video/latency characteristics include:
-
-- H.264 NVENC
-- 1080p60
-- approximately 20 Mbps CBR
-- low-latency preset
-- ultra-low-latency tuning
-- zero-latency behavior
+- H.264 NVENC, 1080p60
+- about 20 Mbps CBR
+- low-latency preset / ULL tuning / zerolatency
 - no B frames
 - GOP 30
-- 1 MB-ish VBV target
-- flush packets
 - AAC 192 kbps / 48 kHz
+- `aresample=48000:async=1000:first_pts=0`
+- `-flush_packets 1`
+- `-bsf:v dump_extra=freq=keyframe`
 
-Do not use:
+Do **not** use `-use_wallclock_as_timestamps 1`; it caused non-monotonic DTS. Do **not** suggest `-repeat_headers 1`; unsupported by this h264_nvenc build.
 
-```text
--repeat_headers 1
-```
-
-It is unsupported by the current h264_nvenc build.
-
-Use:
-
-```text
--bsf:v dump_extra=freq=keyframe
--g 30
-```
-
-This reduces cold-start PPS warnings but does not fully eliminate them.
-
-Known warnings such as:
-
-```text
-non-existing PPS 0 referenced
-```
-
-remain deferred cleanup.
-
-## Current SRT publisher
+Current SRT publisher:
 
 ```text
 srt://127.0.0.1:8890?streamid=publish:gameplay&pkt_size=1316&latency=20000&tlpktdrop=1
@@ -110,47 +42,15 @@ srt://127.0.0.1:8890?streamid=publish:gameplay&pkt_size=1316&latency=20000&tlpkt
 
 ## Ingest experiments
 
-### SRT localhost ingest
+SRT localhost ingest is the current default and best overall tested behavior.
 
-Current default.
-
-Best overall behavior so far.
-
-### RTSP/TCP ingest
-
-Tested and rejected.
-
-Pros:
-
-- cleaner teardown
-- PPS warning behavior improved
-
-Cons:
-
-- severe DirectShow real-time-buffer backpressure
-- choppy/warped playback
-
-### RTSP/UDP ingest
-
-Tested and rejected.
-
-Observed:
-
-- RTP packet loss
-- invalid FU-A errors
-- choppy playback
+RTSP/TCP ingest was tested and rejected because DirectShow real-time-buffer backpressure produced choppy/warped playback. RTSP/UDP ingest produced packet loss / invalid FU-A behavior and choppy playback.
 
 Do not casually revisit RTSP ingest without a fundamentally different solution.
 
 ## MediaMTX
 
-Current version:
-
-```text
-1.21.1
-```
-
-Current relevant config:
+Current version: `1.21.1`.
 
 ```yaml
 readTimeout: 2s
@@ -161,289 +61,104 @@ runOnDemandStartTimeout: 15s
 runOnDemandCloseAfter: 10s
 ```
 
-There is no active `runOnUnDemand` command.
+No active `runOnUnDemand`.
 
-The earlier `readTimeout: 10s` allowed stale SRT publisher state to persist too long after shutdown.
+Important source-verified behavior:
 
-Reducing it to `2s` improved rapid reconnect behavior.
-
-## MediaMTX 1.21.1 source-verified demand behavior
-
-During recovery debugging, MediaMTX 1.21.1 source was inspected directly.
-
-Verified:
-
-- a DESCRIBE waiting for a source is not counted as an active reader
-- publisher loss does not reset the existing on-demand state
+- DESCRIBE waiting for a source is not an active reader
 - removing the final active reader arms close-after
-- therefore a recovering Client can still be waiting while MediaMTX considers no active reader present
-- `runOnDemandStartTimeout` applies to a fresh command-start cycle and rejects waiting requests when it expires
+- a recovering Client may still be waiting while MediaMTX considers no reader active
+- `runOnDemandStartTimeout` applies to a fresh command-start cycle
 
-The architectural consequence remains important: MediaMTX is not the authoritative FFmpeg lifecycle owner.
-
-The Host now owns FFmpeg directly while MediaMTX only creates and destroys a lightweight demand helper process.
+Therefore MediaMTX is not authoritative for FFmpeg recovery/lifecycle.
 
 ## Native Host demand signaling
 
-Current implementation lives primarily in:
+Primary implementation: `windows/service/src/demand.rs`.
 
-```text
-windows/service/src/demand.rs
-```
+MediaMTX launches `pgc-host-windows.exe --demand-signal`. Helper mode runs before normal Host singleton/console startup, connects to the running Host over localhost, sends the expected hello, then holds the connection open. Open connection equals one demand signal.
 
-MediaMTX launches:
+The Host demand listener binds localhost on an ephemeral port, ignores connections without the expected hello, and can reset/drop demand signals when MediaMTX exits.
 
-```text
-pgc-host-windows.exe --demand-signal
-```
-
-Helper behavior:
-
-- helper mode is handled before normal Host singleton/console startup
-- helper connects to the already-running Host over localhost TCP
-- helper sends the expected demand hello line
-- helper holds the TCP connection open
-- connection open = one active demand signal
-- helper termination/connection close = that signal ended
-
-The Host demand listener:
-
-- binds `127.0.0.1` on an ephemeral port
-- exposes the selected port to MediaMTX through Host-provided environment/config
-- ignores localhost connections that do not send the expected hello line
-- can reset/drop all signals when MediaMTX exits
-
-This architecture intentionally allows arbitrary compatible RTSP readers to cause demand through MediaMTX without requiring PGC-specific Client control messages.
+This intentionally allows arbitrary compatible RTSP readers to trigger demand without PGC-specific Client control messages.
 
 ## Native Host FFmpeg ownership
 
-Current implementation lives primarily in:
-
-```text
-windows/service/src/ffmpeg.rs
-```
+Primary implementation: `windows/service/src/ffmpeg.rs`.
 
 FFmpeg discovery order:
 
 1. `PGC_FFMPEG_PATH`
 2. `C:\ffmpeg\bin\ffmpeg.exe`
-3. `ffmpeg\ffmpeg.exe` beside the Host executable
+3. `ffmpeg\ffmpeg.exe` beside Host
 
-Missing FFmpeg currently fails Host startup rather than waiting until first viewer demand.
+Missing FFmpeg currently fails Host startup.
 
-The Host directly owns the encoder child handle.
-
-Current lifecycle rules:
+Lifecycle:
 
 - no demand -> no FFmpeg
 - first demand -> launch FFmpeg
-- at most one owned FFmpeg
-- unexpected FFmpeg exit while demand remains -> restart with bounded backoff
-- demand disappears -> wait grace period, then stop FFmpeg
-- Host shutdown -> stop/confirm FFmpeg before stopping MediaMTX
-- MediaMTX unexpected exit -> clear demand, stop/confirm FFmpeg, then restart MediaMTX
+- at most one owned encoder
+- unexpected encoder exit while demand remains -> restart with 1s / 2s / 5s backoff
+- backoff resets after about 10s healthy
+- no demand -> 5s Host grace, then send `q`, wait ~3s, escalate if necessary, confirm up to ~5s
+- MediaMTX failure -> clear demand, stop/confirm FFmpeg, restart MediaMTX
+- Host shutdown -> confirm FFmpeg then MediaMTX are gone
 
-Restart backoff:
+If a process refuses termination, keep ownership and do not launch a replacement on top of it.
 
-```text
-attempt 1: 1s
-attempt 2: 2s
-subsequent: 5s
-```
+## Job Object containment
 
-Backoff resets after approximately 10 seconds of healthy encoder operation.
-
-### Graceful stop
-
-Stop path:
-
-1. send `q` to FFmpeg stdin
-2. wait up to approximately 3 seconds for graceful exit
-3. if still running, terminate/kill
-4. confirm exit for up to approximately 5 additional seconds
-5. if still alive, keep that process owned and do not launch a replacement encoder
-
-Real Windows validation confirmed FFmpeg accepts `q` over the owned stdin pipe and exits cleanly in the normal no-demand path.
-
-## Current no-demand timing
-
-MediaMTX:
-
-```text
-runOnDemandCloseAfter: 10s
-```
-
-Host:
-
-```text
-FFmpeg no-demand grace: 5s
-```
-
-Observed normal flow:
-
-```text
-last RTSP reader leaves
--> ~10s
--> demand helper ends
--> Host logs demand inactive
--> ~5s
--> Host sends q
--> FFmpeg exits cleanly
-```
-
-Total time from last reader to idle is approximately 15-16 seconds.
-
-This is currently considered conservative but stable. Do not shorten it merely because it feels long; first test rapid reconnect/recovery behavior and verify shorter timing does not reintroduce thrash.
-
-## Windows Job Object containment
-
-Current implementation:
-
-```text
-windows/service/src/job.rs
-```
-
-The Host creates a kill-on-close Windows Job Object and assigns MediaMTX and FFmpeg to it on a best-effort basis.
-
-Purpose:
-
-- if the Host is hard-killed, owned relay/encoder children should also die
-- reduce orphan processes after abnormal termination
-
-Assignment failure logs a warning and does not currently fail Host startup.
-
-Target-platform hard-kill behavior should continue to be included in future stress/regression testing.
+`windows/service/src/job.rs` creates a kill-on-close Job Object and assigns MediaMTX/FFmpeg best-effort. Purpose: abnormal Host termination should not orphan infrastructure that holds ports/capture/encoder resources.
 
 ## Legacy PowerShell bridge
 
-The old architecture was:
-
-```text
-MediaMTX
--> runOnDemand
--> start-gameplay.ps1
--> FFmpeg
-```
-
-and:
-
-```text
-runOnUnDemand
--> stop-gameplay.ps1
-```
-
-It also used a PID file and lifecycle log.
-
-The scripts remain under:
-
-```text
-windows/service/scripts/
-```
-
-with LEGACY / DEPRECATED headers for reference/rollback context, but they are no longer referenced by the active MediaMTX configuration or Host lifecycle.
-
-There is no `gameplay-lifecycle.log` in the native architecture.
-
-Do not reintroduce PowerShell/PID-file ownership without an explicit architecture decision.
-
-## Native Host Windows validation checkpoint
-
-Basic real Windows hands-on validation passed after the native ownership implementation.
-
-Observed working behaviors included:
-
-- Host starts idle with no FFmpeg
-- first Client demand launches FFmpeg
-- real DirectShow HD60 S+ capture opens
-- NVENC publishes to MediaMTX over SRT
-- Client receives and plays RTSP stream
-- FFmpeg unexpected exit is detected and restarted while demand remains
-- MediaMTX unexpected exit causes Host cleanup and restart
-- graceful no-demand FFmpeg stop accepts `q`
-- no PowerShell appears in the active lifecycle
-- Host returns to lightweight idle state after demand ends
-
-Initial resource baseline on the prototype machine:
-
-```text
-idle: ~35 MB RAM, effectively no CPU/GPU use
-active: ~240 MB RAM, ~11% GPU
-```
-
-These are informal first measurements, not a full profiling study.
-
-## First-stream slow-reader / audio-warble observation
-
-On the first real connection after the native architecture update, the stream audio was noticeably warbly/distorted and MediaMTX reported:
-
-```text
-reader is too slow, discarding 1071 frames
-```
-
-After restarting the stream, subsequent sessions were substantially healthier.
-
-No root cause is established.
-
-Possible areas to investigate later:
-
-- first capture-device open after Host startup
-- DirectShow/capture-card warm-up
-- initial FFmpeg clock establishment
-- MediaMTX initial buffering/burst behavior
-- ffplay joining behind the live edge
-- initial A/V synchronization
-
-Do not assume this is equivalent to shader compilation/cache warm-up; there is currently no evidence of a one-time compiled artifact or persistent cache causing the behavior.
-
-Do not change buffering/timing parameters based on this single observation. Reproduce and correlate first.
+Old `runOnDemand -> start-gameplay.ps1 -> FFmpeg` / PID-file ownership is deprecated. Scripts may remain for archaeological/reference value, but active lifecycle must not silently drift back to them.
 
 ## Host singleton
-
-Mutex:
 
 ```text
 Global\PortableGameCasterHost.v1
 ```
 
-Rules:
+Acquire before Host-owned resources. `ERROR_ACCESS_DENIED` may represent an existing instance across privilege contexts. `.v1` is not SemVer.
 
-- acquire before MediaMTX, mDNS, Ctrl+C/resource ownership
-- second Host exits before starting resources
-- `ERROR_ACCESS_DENIED` can represent an already-running Host across privilege contexts
-- handle is RAII-owned
-- `.v1` is not Host SemVer
+## Native Windows baseline
 
-Multiple LAN Hosts are valid.
+Previous real Windows validation of native Host ownership confirmed:
 
-## mDNS
+- idle start with no FFmpeg
+- real HD60 S+ capture/NVENC on demand
+- FFmpeg unexpected-exit restart
+- MediaMTX unexpected-exit cleanup/restart
+- graceful `q` stop
+- no active PowerShell lifecycle
+- lightweight idle recovery
 
-Service:
-
-```text
-_pgc._tcp.local.
-```
-
-Current TXT:
+Informal resource baseline:
 
 ```text
-protocol=rtsp
-path=/gameplay
-version=1
+idle:   ~35 MB, effectively no CPU/GPU
+active: ~240 MB, ~11% GPU
 ```
 
-Windows advertiser uses `mdns-sd`.
+## First-stream slow-reader / audio-warble observation
 
-`enable_addr_auto()` successfully supports IPv4 resolution on macOS.
+One first real connection after the native ownership change showed warbly audio and MediaMTX `reader is too slow, discarding 1071 frames`; immediate later sessions were healthier.
 
-Future TXT should use explicit protocol-version naming.
+No root cause established. Possible correlation areas: first capture-device open, DirectShow/card warm-up, initial clocks, MediaMTX burst/buffering, ffplay joining behind live edge. Do not retune transport/buffers from this single observation.
+
+## Windows console / hotkeys transition
+
+Current logging branch introduces `hotkeys.rs` and console `L` to open logs. Native Windows validation must verify Ctrl+C, redirected-input behavior, repeated `L`, and shutdown.
+
+Known must-fix defect: classic Windows QuickEdit/selection can pause apparent console progress after the user clicks/selects text. Disable selection-induced suspension programmatically while preserving required input flags and re-test `L` and Ctrl+C.
+
+Future Host console direction is deliberately lightweight: logs scroll normally, with a restrained footer/hotkey/status region rather than a heavyweight full-screen TUI. Likely future controls include `S` Settings and `H` Help, but those are not yet final.
 
 ## macOS ffplay
 
-Current Homebrew dependency:
-
-```text
-ffmpeg-full
-```
+Current Homebrew dependency: `ffmpeg-full`.
 
 Known-good flags:
 
@@ -460,253 +175,146 @@ Known-good flags:
 -stats
 ```
 
-Notes:
-
-- `-sync ext` fixed playback pacing.
-- larger probe/analyze values were needed for reliable AAC/rate detection.
-- near-zero buffering removed old manual pause/seek workarounds.
-- software decode performs adequately on M4.
-- VideoToolbox experiment hit Vulkan portability issues.
+Software decode performs adequately on M4. VideoToolbox experiments hit Vulkan portability issues and are not needed currently.
 
 ## Client media liveness
 
-Current health source is ffplay stderr/status output.
+ffplay status telemetry is the current health source. With `-sync ext`, the first/master-clock value keeps advancing during a frozen stream and is not a liveness signal.
 
-Example:
+Current algorithm after MediaStarted:
 
-```text
-5.58 A-V: -0.091 fd=   0 aq=    0KB vq=   29KB sq=    0B
-```
+1. ignore master clock;
+2. compare remaining status fields;
+3. about five seconds unchanged -> `TransportEvent::Stalled`;
+4. terminate player and enter normal recovery.
 
-Important:
+Known gaps: ffplay may stop emitting status entirely; audio-related fields may move while video is frozen.
 
-With `-sync ext`, the first/master-clock column continues increasing during a frozen stream.
+## Client state/control rules
 
-Therefore it is not a valid liveness signal.
-
-Current algorithm:
-
-1. MediaStarted confirmed.
-2. Strip/ignore master-clock column.
-3. Compare remaining status fields.
-4. Healthy playback changes frequently.
-5. Approximately five seconds of unchanged remainder emits `TransportEvent::Stalled`.
-6. Client exits Playing and enters normal recovery.
-
-Known limitations:
-
-- if ffplay stops outputting status entirely, no new comparison arrives
-- audio progress may change A/V-related fields while video alone is frozen
-
-Backlog:
-
-- no-telemetry timeout
-- separate video/audio progress
-
-Do not expand the interim parser prematurely without a real failure case.
-
-## Client state / control rules
-
-- UI state describes observable reality.
+- UI describes observable reality.
 - Playing requires decoded media.
-- Fresh connections never use reconnect states.
-- Recovery remains pinned to the same Host.
-- Restored RTSP enters `WaitingForStream`.
-- Cancel immediately returns to Idle.
-- Cancel invalidates worker generation.
-- Cancel kills race-started ffplay.
-- Stop Stream returns to Idle without recovery.
-- Quit/window close terminates ffplay.
-- No Client -> Host session-cancel message is desired.
+- Fresh connection never uses reconnect states.
+- Recovery stays pinned to same Host.
+- Restored RTSP -> WaitingForStream.
+- Cancel immediately returns Idle and invalidates stale workers.
+- Stop Stream returns Idle without recovery.
+- Quit/window close terminates player.
+- No Client -> Host session-cancel message.
 
 Timeout copy:
 
 ```text
-cold: Stream did not start.
+cold:     Stream did not start.
 recovery: Stream did not resume.
 ```
 
-Current diagnostic gap:
+Visible countdowns use monotonic deadlines. Do not reintroduce loop-cadence-derived countdowns.
 
-Explicit actions/final Idle state are not always logged. A session can end with the last `[STATE]` line still showing `Playing | Connected.` even though the UI has returned to Idle.
+## Unified logging implementation
 
-The unified logging pass should add action breadcrumbs and final-state logs such as:
+UTC/Zulu millisecond timestamps are deliberate for cross-machine correlation.
 
-```text
-[ACTION] Stop Stream requested.
-[STATE]  Idle | Ready to search.
-```
+Conceptual levels: Quiet / Normal / Debug / Verbose.
 
-## Countdown implementation
+Current Mac and Windows logging cores are intentionally byte-identical through the shared core region. Do not let them drift casually. A shared crate is a pre-release architecture-audit candidate, not an automatic refactor just because duplication exists.
 
-Visible countdowns should use monotonic deadlines.
+### Session files
 
-Current Client uses deadline-based timing for:
-
-- reconnect
-- warm-up fallback
-- discovery polling cadence
-
-Previous issue:
-
-The worker calculated a displayed second, performed network/mDNS work, then emitted the stale value.
-
-This made seconds visually uneven.
-
-Do not reintroduce loop-cadence-derived countdowns.
-
-## Logging
-
-UTC/Zulu millisecond timestamps are deliberate.
-
-Example:
+File level policy:
 
 ```text
-[07:23:18.492Z]
+terminal Quiet/Normal/Debug -> file Debug
+terminal Verbose            -> file Verbose
 ```
 
-This makes multi-machine correlation direct.
-
-### Current Client
-
-- packaged app/no flag: Off
-- development binary/no flag: Debug
-- `--debug`: Debug
-- `--verbose`: raw/Trace/Verbose
-- `--quiet`: Off
-
-### Current Host
-
-Host does not yet have finalized Normal / Debug / Verbose parity.
-
-Some diagnostic output remains unconditional.
-
-MediaMTX and FFmpeg output are currently relayed through the Host with Host-side UTC timestamps/source labels.
-
-### Unified logging target
-
-Normal:
-
-- important lifecycle
-- low overhead
-- no raw external output
-
-Debug:
-
-- structured PGC diagnostics
-- event-driven
-- source label `[PGC]` may be omitted if redundant
-
-Verbose:
-
-- Debug plus raw external sources
-- explicit source identity required:
-  - PGC
-  - FFPLAY
-  - FFMPEG
-  - MTX
-
-Presentation:
-
-- dim timestamp
-- fixed-width source/category columns
-- stable colours
-- same category colours across Host and Client
-- aligned message column
-- no ANSI in redirected output
-- centralized formatting
-
-## Host console presentation
-
-Windows Host currently attempts to widen a classic attached console to approximately 140 columns.
-
-Purpose:
-
-FFmpeg progress output updates on one physical line rather than wrapping and visually spewing.
-
-Behavior should remain best-effort.
-
-Unsupported terminals or redirected output should not fail startup.
-
-The Host also adds colour to MediaMTX severity tags and greys timestamp prefixes when output is attached to an ANSI-capable terminal because MediaMTX itself does not force colour when stdout is piped.
-
-## Logging relay caveat
-
-FFmpeg progress uses carriage-return updates.
-
-When mixed with stamped newline-oriented logs:
-
-- progress lines can visually collide with a newly stamped line
-- structured logs can be glued into FFmpeg progress text
-- source lines can split mid-message
-- stale trailing characters can remain
-
-This is visible in current Windows logs and is a presentation problem, not evidence that lifecycle events themselves are corrupted.
-
-The unified logging pass should preserve readable progress without building an unnecessarily large terminal-rendering subsystem.
-
-## Audio routing prototype
-
-Current Denon AVR-X2800H behavior:
-
-Main HDMI audio output cannot simultaneously provide the desired AVR speaker path and capture-device HDMI audio path.
-
-Prototype workaround:
+Mac folder:
 
 ```text
-ZONE2 source
--> ZONE2 analog RCA
--> HD60 S+ analog input
+~/Library/Logs/Portable Game Caster/
 ```
 
-This allows:
+Accepted Mac naming:
 
-- normal AVR speaker playback
-- stereo capture audio
+```text
+pgc-client-latest.log
+pgc-client-YYYY-MM-DDTHH-MM-SS.sssZ.log
+```
 
-Future GC575 lacks analog input; PC Line In or another capture-audio path may be used.
+At launch, archive previous latest using the session ID embedded in its header. If session ID is unreadable, fallback to mtime. If rename cannot be completed safely, append/warn rather than truncating. Only exact-pattern archives rotate; keep newest five. Renamed/copied/unrelated logs are never touched.
 
-## Testing matrix
+Windows Host currently uses timestamped per-launch logs and has not yet aligned to `latest`.
 
-### Golden path
+`PGC_LOG_DIR` is the test/override folder.
 
-- Host starts
-- Mac discovers Host
-- stream requested
-- media begins
-- Client reaches Playing
-- Stop Stream -> Idle
-- Search works again
-- Quit cleans player
+### FFmpeg output diagnostics
 
-### Client failures
+`encoder_output.rs` keeps a small recent FFmpeg stderr window (currently 12 useful lines, 300-char bound), filters banner noise, extracts likely causes, and supports publisher-wait diagnostics. Raw subprocess output remains Verbose.
 
-- discovery unavailable
-- RTSP unavailable
-- stream starts slowly
-- stream disappears
-- ffplay killed
-- media freezes without process exit
-- recovery timeout
+### Synchronous logging
 
-### Host failures
+Current sinks write synchronously. Do not prematurely optimize. During the future shared-core audit, consider:
 
-- FFmpeg killed
-- MediaMTX killed
-- Host killed
-- rapid FFmpeg failure/restart
-- rapid MediaMTX failure/restart
-- awkward timing around demand start/stop
+```text
+producers -> bounded event queue -> one logging worker -> terminal/file/UI sinks
+```
 
-### Native Host ownership regression checks
+No thread per message, no unbounded queue. Critical structured events should be preserved; low-value raw Verbose chatter may eventually be throttled/dropped if a logger falls behind rather than disturbing media/supervision.
 
-- Host idle contains no ffmpeg.exe
-- first demand launches exactly one FFmpeg
-- last demand eventually stops FFmpeg
-- FFmpeg failure while demand exists causes Host restart
-- MediaMTX failure does not leave stale FFmpeg
-- repeated abuse never produces multiple owned FFmpeg instances
-- Host hard-kill terminates MediaMTX and FFmpeg through Job Object containment
-- Host shutdown leaves no MediaMTX or FFmpeg process
-- PowerShell is absent from normal capture lifecycle
-- idle Task Manager footprint remains near-zero on CPU/GPU
+### Log-file deletion edge case
+
+If a user manually deletes active `pgc-client-latest.log` while the app is open, the Unix file handle may remain valid while the path disappears. Acknowledge as low-priority hardening; do not solve until it matters.
+
+## macOS interaction implementation notes
+
+- utility shelf child controls must actually be parented to the shelf; adding a view to a second parent reparents it
+- hover implementation uses a restrained overlay because a bezel tint did not render in off-screen checks
+- the current overlay assumes a regular push-button bezel around 24pt high; revisit during architecture/UX refactor if platform variation matters
+- initial focus is none
+- focus transfers within the logical primary-action slot
+- no default button
+- window-level key policy owns `L`, Space/Return/Enter repeat suppression, and focused Return/Enter activation
+- editable text and Cmd/Ctrl/Option combinations are not intercepted
+- one physical activation should result in one action even if the key is held
+
+Development-only `--ui-self-test` sends synthetic events through the real window path without discovery. Optional `PGC_UI_SNAPSHOT_DIR` renders snapshots. Release binary does not contain the self-test.
+
+## Cross-machine handoff notes
+
+Patch/snapshot handoffs must include untracked files and a declared baseline. Full-file snapshots are a valid fallback when line-ending conversion makes patches brittle. Keep the source working copy until the target reconstructs and verifies the delta.
+
+Do not treat a Mac build/test of Windows-guarded code as native Windows validation.
+
+## Testing priorities
+
+Golden path:
+
+- Host idle
+- Client discovers/connects
+- demand starts encoder
+- decoded media -> Playing
+- Stop -> Idle
+- Search again
+- Quit cleanly
+
+Windows regression matrix should include:
+
+- repeated console clicks/selection without Host pause
+- `L` repeated
+- Ctrl+C first press
+- FFmpeg kill/restart
+- MediaMTX kill/reset/restart
+- no-demand teardown
+- hard-kill orphan containment
+- session log creation/rotation
+- Normal/Debug/Verbose/Quiet presentation
+
+macOS interaction regression matrix should include:
+
+- utility shelf parenting
+- hover / pressed / focus distinction
+- `L` repeated and Caps Lock behavior
+- Space/Return/Enter single activation
+- held-key suppression
+- Search -> Cancel -> Stop -> Search focus continuity
+- no accidental Quit/default-button behavior

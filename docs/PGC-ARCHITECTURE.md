@@ -2,7 +2,7 @@
 
 ## 1. Purpose
 
-Portable Game Caster is a local-network streaming/capture system intended to make console gameplay easy to view and share from another device without requiring a conventional capture/streaming workflow every time.
+Portable Game Caster is a local-network streaming/capture system intended to make console gameplay easy to view and share from another device without rebuilding a conventional capture/streaming workflow each time.
 
 Initial real-world target:
 
@@ -11,41 +11,21 @@ Initial real-world target:
 - low-latency LAN playback on a MacBook
 - Discord app/window sharing from the Mac
 
-Long-term targets may include:
-
-- Windows
-- macOS
-- Linux
-- Steam Deck
-- Android
-- iOS / iPadOS
+Long-term platform targets may include Windows, macOS, Linux, Steam Deck, Android, and iOS/iPadOS.
 
 ## 2. Architecture principles
 
 ### Truthful state
 
-UI state describes observable reality.
+UI state describes observable reality. `Playing` requires confirmed decoded media. A running process, reachable port, RTSP handshake, or ffplay process alone is insufficient.
 
-`Playing` means decoded media flow has been confirmed.
-
-The following alone are insufficient:
-
-- process exists
-- TCP port is reachable
-- RTSP handshake succeeds
-- ffplay is running
+Fresh connections never use reconnect states. Reconnect language is reserved for recovery after a previously healthy Playing session. Once connectivity is restored, the Client returns to `WaitingForStream` until decoded media is confirmed again.
 
 ### Broadcast/listener model
 
-PGC is a broadcast/listener architecture.
-
-Clients consume a stream. They do not tightly own Host sessions.
-
-Client-side Cancel or Stop Stream are local Client actions rather than Host session-control commands.
+Clients consume a local broadcast. They do not tightly own Host sessions. Client Cancel and Stop Stream are local actions rather than Host session-control commands.
 
 ### Demand-driven Host
-
-Host capture is demand-driven by design.
 
 When no viewer demand exists:
 
@@ -56,114 +36,56 @@ mDNS: advertising
 FFmpeg: stopped
 capture device: unopened
 NVENC: idle
-gameplay publisher traffic: none
+publisher traffic: none
 ```
 
-A few seconds of first-stream startup is acceptable.
-
-Low idle resource use is more important than instant first-frame startup.
+A few seconds of first-stream startup is acceptable. Low idle resource use is a first-class product requirement.
 
 ### Process ownership
 
-The native Windows Host owns FFmpeg lifecycle.
+The native Host owns FFmpeg lifecycle: launch, process lifetime, restart, stop, capture/encoder health, and shutdown cleanup. MediaMTX is relay and demand-detection infrastructure, not encoder owner.
 
-MediaMTX is relay and demand-detection infrastructure; it does not own the encoder process.
-
-The Host owns:
-
-- FFmpeg launch
-- FFmpeg process lifetime
-- FFmpeg restart
-- FFmpeg stop
-- capture/encoder health
-- cleanup on Host shutdown
-
-## 3. Media data path
+## 3. Media path
 
 ```text
 Console / HDMI chain
-        |
-        v
-Capture device
-        |
-        v
-Windows FFmpeg
-  - DirectShow input
-  - H.264 NVENC
-  - AAC audio
-        |
-        | SRT localhost
-        v
-MediaMTX
-        |
-        | RTSP/TCP over LAN
-        v
-PGC Client
-        |
-        v
-ffplay / future native player layer
-        |
-        v
-Discord share / local viewing
+-> capture device
+-> Windows FFmpeg (DirectShow, H.264 NVENC, AAC)
+-> SRT localhost
+-> MediaMTX
+-> RTSP/TCP over LAN
+-> Portable Game Caster Client
+-> ffplay / future native playback layer
+-> Discord share / local viewing
 ```
 
 ## 4. Windows Host
 
-### 4.1 Responsibilities
-
 The Windows Host currently owns:
 
-- MediaMTX process supervision
+- MediaMTX supervision
 - mDNS advertisement
-- machine-wide single-instance protection
-- FFmpeg process ownership
+- machine-wide singleton protection
+- native FFmpeg process ownership
 - demand-state interpretation
-- capture/encoder lifecycle
-- recovery
+- capture/encoder lifecycle and recovery
 - shutdown cleanup
 - diagnostics
 - Windows Job Object containment for child infrastructure
 
-Future responsibilities include:
+Future Host responsibilities include capture-device enumeration, video/audio source selection, persisted configuration, encoder/backend selection, lightweight console controls, and richer capture/media health reporting.
 
-- capture-device enumeration
-- audio/video source selection
-- encoder/backend selection
-- persisted settings
-- Host UI/control surface
-- capture/media health reporting
-
-### 4.2 Single-instance behavior
+### Singleton
 
 Only one Host may run per Windows machine.
-
-Current named mutex:
 
 ```text
 Global\PortableGameCasterHost.v1
 ```
 
-The `.v1` suffix is not tied to product SemVer.
+`.v1` identifies the singleton contract, not Host SemVer. Multiple Hosts on one LAN are valid.
 
-It represents the singleton contract and should only change intentionally if PGC ever permits multiple incompatible Host generations on one machine.
-
-Multiple PGC Hosts on the LAN are valid.
-
-### 4.3 Native FFmpeg ownership
-
-Current architecture:
-
-```text
-PGC Host
-|- MediaMTX supervisor
-|- native FFmpeg owner
-|- demand listener
-|- --demand-signal helper mode
-|- Windows Job Object
-|- mDNS
-|- recovery
-`- lifecycle
-```
+### Demand signaling and FFmpeg ownership
 
 MediaMTX `runOnDemand` launches:
 
@@ -171,182 +93,114 @@ MediaMTX `runOnDemand` launches:
 pgc-host-windows.exe --demand-signal
 ```
 
-The helper connects to the running Host over localhost and holds that TCP connection open.
+The helper connects to the already-running Host over localhost and holds the connection open. Open helper connection means reader demand exists; close means that demand signal ended. The helper never owns FFmpeg.
 
-```text
-helper connection open
-= reader demand exists
+This preserves demand from arbitrary compatible RTSP readers without requiring a PGC-specific Client control protocol.
 
-helper connection closes
-= that demand signal ended
-```
-
-This preserves the useful property that any compatible RTSP reader can create demand without requiring PGC-specific Client session commands.
-
-The helper is not the encoder owner. The already-running Host remains authoritative.
-
-Native Host ownership rules:
-
-- Host directly launches FFmpeg.
-- Host retains the child/process handle.
-- Host guarantees no more than one owned FFmpeg.
-- Host distinguishes expected stop from unexpected exit.
-- Host restarts FFmpeg when demand remains.
-- Host stops FFmpeg when demand ends.
-- Host shutdown confirms FFmpeg and MediaMTX are gone.
-- PID files are not the primary ownership model.
-- PowerShell start/stop scripts are legacy/deprecated and are not part of the active lifecycle.
-
-### 4.4 Demand lifecycle
-
-Current behavior:
+### Demand lifecycle
 
 ```text
 no viewers
 -> no FFmpeg
 
-first viewer demand
--> MediaMTX starts --demand-signal helper
+first viewer
+-> MediaMTX starts demand helper
 -> Host receives demand
 -> Host launches FFmpeg
--> FFmpeg opens capture
+-> capture opens
 -> FFmpeg publishes SRT
--> MediaMTX exposes stream
--> Client confirms media
+-> MediaMTX serves RTSP
+-> Client confirms decoded media
 -> Playing
 ```
 
-Current teardown:
+Teardown:
 
 ```text
 last viewer leaves
 -> MediaMTX waits 10s runOnDemandCloseAfter
 -> demand helper exits
--> Host sees demand inactive
 -> Host waits 5s encoder grace
 -> Host sends q to FFmpeg
--> FFmpeg exits gracefully when possible
+-> escalates only if needed
 -> capture/NVENC return idle
 ```
 
-Normal last-reader-to-idle time is therefore approximately 15 seconds plus graceful FFmpeg shutdown time.
+Normal last-reader-to-idle is therefore about 15 seconds plus graceful FFmpeg exit time.
 
-FFmpeg recovery:
+Unexpected FFmpeg exit while demand remains uses bounded restart backoff: 1s, 2s, then 5s; reset after about 10 seconds healthy.
 
-```text
-FFmpeg fails while demand exists
--> Host notices exit
--> Host backs off briefly
--> Host relaunches FFmpeg
--> MediaMTX receives new publisher
--> Client recovery continues
-```
+MediaMTX failure clears demand, stops/confirms FFmpeg, restarts MediaMTX, and waits for fresh demand before encoding again.
 
-Current restart backoff is 1s, then 2s, then 5s, with reset after a healthy run of approximately 10 seconds.
+### Job Object
 
-MediaMTX failure:
+MediaMTX and FFmpeg are assigned to a Host-owned kill-on-close Windows Job Object on a best-effort basis. Assignment failure warns rather than failing startup. Hard-killing Host should not leave owned children behind.
 
-```text
-MediaMTX fails
--> Host detects exit
--> Host clears all demand signals
--> Host stops and confirms FFmpeg
--> Host restarts MediaMTX
--> no encoder runs until fresh reader demand exists
-```
+### Console and observability — active transition
 
-### 4.5 Job Object containment
+Windows logging/console work is implemented but still awaiting native Windows acceptance on this branch.
 
-The Host creates a Windows Job Object configured for kill-on-close and assigns MediaMTX and FFmpeg to it on a best-effort basis.
+Current intended Host console behavior:
 
-Purpose:
+- Normal exposes meaningful DEMAND / ENCODER / STREAM lifecycle
+- publisher wait/availability and configured media are visible
+- publisher-wait warnings at 5 / 15 / 30 seconds
+- unexpected FFmpeg exit includes a best recent `Cause:` line
+- demand-loss wording reports only what Host can actually observe
+- `L` opens the logs folder
+- console widening is best-effort
 
-- hard-killing the Host should also terminate owned child infrastructure
-- shutdown should not leave encoder/relay orphans
-
-Failure to assign a child to the Job Object is currently treated as a warning rather than a Host startup failure.
+Known immediate issue: classic Windows QuickEdit/selection can pause apparent console progress. The Host must disable selection-induced suspension without breaking Ctrl+C or the `L` hotkey. Native validation is required before this console/logging state is accepted.
 
 ## 5. Capture prototype
 
-Current prototype hardware:
+Prototype capture device: Elgato HD60 S+.
 
-```text
-Elgato HD60 S+
-```
-
-Video input:
+Video:
 
 ```text
 Game Capture HD60 S+
+YUY2 / yuyv422
+1920x1080 @ 60 fps
 ```
 
-Observed video:
-
-- YUY2 / yuyv422
-- 1920x1080
-- 60 fps
-
-Audio input:
+Audio:
 
 ```text
 Digital Audio Interface (Game Capture HD60 S+)
+PCM s16le / 44.1 kHz / stereo
 ```
 
-Observed audio:
+Current AVR workaround uses Denon Zone 2 analog output so AVR speakers and stereo capture can coexist.
 
-- PCM s16le
-- 44.1 kHz
-- stereo
+## 6. Encode pipeline constraints
 
-Current AVR audio workaround uses Denon Zone 2 analog output so speakers remain active while the capture device receives stereo audio.
+Current Windows prototype uses Gyan FFmpeg 8.0.1 full, intentionally pinned for GTX 1080 Ti / Pascal compatibility.
 
-## 6. FFmpeg encode pipeline
+Current characteristics:
 
-Current prototype target:
-
-- FFmpeg Gyan 8.0.1 full build
-- YUY2 -> NV12 conversion
-- H.264 NVENC
-- 1080p60
-- approximately 20 Mbps CBR
-- low-latency preset/tuning
-- zero-latency behavior
+- YUY2 -> NV12 before Pascal NVENC
+- H.264 NVENC 1080p60
+- about 20 Mbps CBR
+- low/ultra-low latency tuning, zerolatency
 - no B frames
 - GOP 30
-- AAC 192 kbps
-- 48 kHz stereo
+- AAC 192 kbps / 48 kHz stereo
 - async resampling
-- `dump_extra=freq=keyframe`
+- `-bsf:v dump_extra=freq=keyframe`
 
-Windows FFmpeg is intentionally pinned for GTX 1080 Ti / Pascal compatibility.
+Do not use `-use_wallclock_as_timestamps 1`; it caused non-monotonic DTS. Do not suggest `-repeat_headers 1`; unsupported by the pinned build.
 
 ## 7. MediaMTX
 
-Current version:
+Current version: `1.21.1`.
 
 ```text
-1.21.1
+SRT publisher: localhost:8890, streamid=publish:gameplay
+RTSP reader:    :8554/gameplay
 ```
 
-Default endpoints:
-
-- SRT: `8890`
-- RTSP: `8554`
-- path: `/gameplay`
-
-FFmpeg publisher:
-
-```text
-srt://127.0.0.1:8890?streamid=publish:gameplay&pkt_size=1316&latency=20000&tlpktdrop=1
-```
-
-Client reader:
-
-```text
-rtsp://<host>:8554/gameplay
-```
-
-Current relevant settings:
+Relevant settings:
 
 ```text
 readTimeout: 2s
@@ -357,22 +211,9 @@ runOnDemandStartTimeout: 15s
 runOnDemandCloseAfter: 10s
 ```
 
-There is no active `runOnUnDemand` script.
+No active `runOnUnDemand` script.
 
-### 7.1 MediaMTX demand semantics
-
-MediaMTX 1.21.1 source was inspected during recovery debugging.
-
-Important verified behavior:
-
-- a DESCRIBE waiting for a source does not count as an active reader
-- publisher loss does not itself reset all on-demand state
-- close-after can expire while a Client is still waiting for recovery
-- therefore MediaMTX's internal demand model is not sufficient to own encoder recovery semantics
-
-The current architecture keeps MediaMTX responsible only for starting/stopping the lightweight demand helper. The Host owns FFmpeg recovery while the helper remains connected.
-
-If real-world FFmpeg recovery ever regularly exceeds the current MediaMTX close-after window, the preferred follow-up is for the Host to consult MediaMTX reader state/control API before treating demand as truly gone. Returning FFmpeg lifecycle ownership to MediaMTX is not the preferred solution.
+Source inspection established that a waiting DESCRIBE is not counted as an active reader and close-after can expire while a Client is still waiting. Therefore MediaMTX demand semantics are insufficient to own PGC encoder recovery. Do not return FFmpeg lifecycle ownership to MediaMTX scripts.
 
 ## 8. Discovery
 
@@ -380,12 +221,6 @@ Service:
 
 ```text
 _pgc._tcp.local.
-```
-
-Instance:
-
-```text
-Portable Game Caster
 ```
 
 Current TXT:
@@ -396,252 +231,110 @@ path=/gameplay
 version=1
 ```
 
-The generic `version` field should eventually become an explicitly named protocol-version field.
+`version` currently means protocol compatibility and should eventually become an explicit `protocol_version` field.
 
-Client discovery rules:
-
-- browse for PGC services
-- tolerate service resolution before IPv4 resolution
-- resolve host/IP/port/path/protocol
-- recover against the same Host
-- never silently switch to a different Host during reconnect
-
-Multiple Hosts on one LAN are valid.
-
-Host selection/preference is future Client UX.
+Multiple Hosts on one LAN are valid. Current Client auto-connects to the Host it discovers. The planned first-release Host Browser will discover without auto-connecting and let the user select explicitly.
 
 ## 9. macOS Client
 
-### 9.1 Shell
-
-The current macOS Client is a native AppKit application written in Rust using `objc2`.
-
-Responsibilities:
-
-- render truthful state
-- provide contextual controls
-- own ffplay
-- keep UI work on the main thread
-- move networking/player/reconnect work to workers
-- receive state updates through channels
-
-### 9.2 State model
+Native AppKit application in Rust using `objc2`.
 
 Cold path:
 
 ```text
-Idle
--> Discovering
--> Resolving
--> Connecting
--> WaitingForStream
--> Playing
+Idle -> Discovering -> Resolving -> Connecting -> WaitingForStream -> Playing
 ```
 
 Recovery:
 
 ```text
-Playing
--> ReconnectingStream / ReconnectingHost
--> WaitingForStream
--> Playing
+Playing -> ReconnectingStream/ReconnectingHost -> WaitingForStream -> Playing|Error
 ```
 
-or:
+Controls:
+
+- Idle: Search for Host
+- Busy/recovery: Cancel
+- Playing: Stop Stream
+- Error: Retry
+- Quit always available
+
+Cancel invalidates stale worker generations and terminates race-started ffplay. Stop terminates ffplay and returns to Idle without recovery. No Client -> Host cancel protocol exists.
+
+### Interaction model — UX Approved
+
+- primary action slot contains Search / Cancel / Stop / Retry
+- Quit remains separate
+- utility shelf contains Open Logs Folder
+- no default button
+- initial focus none
+- Space / Return / Enter activate deliberately focused button once
+- held key repeats cannot chain through replacement controls
+- focus follows the logical primary slot across state changes; clears when no replacement exists
+- `L` opens logs folder
+- hover/pressed feedback exists on utility and primary controls
+
+Development-only `--ui-self-test` exercises layout/key/focus behavior without discovery. `PGC_UI_SNAPSHOT_DIR` optionally renders snapshots. It is compiled out of release builds and is engineering validation, not UX acceptance.
+
+## 10. ffplay and media health
+
+Playback transport is RTSP/TCP. Known-good ffplay options include `nobuffer`, `low_delay`, `noinfbuf`, `framedrop`, `sync ext`, probe/analyze settings, and `max_delay 0`.
+
+`Playing` requires confirmed decoded media from ffplay telemetry. After media starts, Client ignores the advancing `-sync ext` master clock and compares the remaining status fields. About five seconds of unchanged non-master progress emits a stall and enters normal recovery.
+
+Known follow-ups: no-telemetry watchdog, separate video/audio liveness, and a first-class health model beyond text parsing.
+
+## 11. Logging and observability
+
+Status:
+
+- macOS Client: UX Approved
+- Windows Host: implemented, awaiting native Windows validation
+- unified logging feature: not Done yet
+
+Modes:
+
+- **Quiet**: no terminal output; session file still written
+- **Normal**: important lifecycle/user-facing production diagnostics
+- **Debug**: structured event-driven Portable Game Caster diagnostics; no raw subprocess firehose
+- **Verbose**: Debug plus raw external provenance and deeper internal state/decision details
+
+Presentation rules:
+
+- UTC/Zulu millisecond timestamps
+- fixed-width source/category fields
+- readable product-facing STATE lines at Normal/Debug
+- raw internal enum/state only at Verbose
+- terminal styling centralized; files/redirects plain text; honor `NO_COLOR`
+- Verbose explicitly identifies `[PGC]`, `[FFPLAY]`, `[MTX]`, `[FFMPEG]`
+- FFmpeg carriage-return progress normalized/throttled rather than corrupting structured lines
+
+Startup header is 50 characters wide and includes title, build channel + SemVer, platform, logging mode, protocol, session ID, and log folder.
+
+Session files:
 
 ```text
-... -> Error
+macOS:   ~/Library/Logs/Portable Game Caster/
+Windows: %LOCALAPPDATA%\Portable Game Caster\Logs\
 ```
 
-Definitions:
+`PGC_LOG_DIR` overrides.
 
-- `Connecting`: establishing host/service handshake
-- `WaitingForStream`: host/service is reachable but media is not yet confirmed
-- `Playing`: decoded media is confirmed
-- `ReconnectingStream`: playback was previously healthy and stream connectivity has been lost
-- `ReconnectingHost`: previously connected Host is no longer discoverable/reachable
-
-Fresh connections never use reconnect states.
-
-### 9.3 Session controls
-
-- Idle: `Search for Host`
-- Busy/recovery/warm-up: `Cancel`
-- Playing: `Stop Stream`
-- Error: `Retry`
-- Quit remains available
-
-Cancel:
-
-- immediately returns to Idle
-- invalidates stale worker generations
-- terminates race-started ffplay
-
-Stop Stream:
-
-- terminates ffplay
-- returns to Idle
-- does not trigger recovery
-
-There is intentionally no Client -> Host session-cancel protocol.
-
-## 10. ffplay integration
-
-Current playback transport:
+macOS Client accepted naming:
 
 ```text
-RTSP/TCP
+pgc-client-latest.log
+pgc-client-YYYY-MM-DDTHH-MM-SS.sssZ.log
 ```
 
-Known-good flags:
+Previous latest is archived using the session ID embedded in its own header. Newest five exact-pattern archives retained; renamed/copied files are outside rotation.
 
-```text
--rtsp_transport tcp
--fflags nobuffer
--flags low_delay
--noinfbuf
--framedrop
--sync ext
--probesize 2M
--analyzeduration 500000
--max_delay 0
--stats
-```
+Windows Host currently uses timestamped per-launch logs; alignment with the Client `latest` scheme remains open.
 
-ffplay stderr is used to derive:
+The logging core is currently duplicated between Mac and Windows and is an obvious shared-crate candidate for the pre-release architecture audit, not an excuse for an immediate abstraction.
 
-- transport loss
-- media-start confirmation
-- stream metadata
-- ongoing progress
+## 12. Versioning and application structure
 
-## 11. Media health
+Client SemVer, Host SemVer, protocol version, and platform build number are independent concepts. Build channel (`Development`, `Nightly`, `Beta`, `Release`) is provenance/presentation, not compatibility.
 
-Current rule:
-
-```text
-Playing = confirmed decoded media flow
-```
-
-After MediaStarted, the Client compares ffplay status information excluding the `-sync ext` master-clock column.
-
-The master clock continues advancing during a frozen stream and is therefore not itself a liveness signal.
-
-Current stall behavior:
-
-```text
-non-master status unchanged for ~5s
--> TransportEvent::Stalled
--> terminate ffplay
--> existing recovery flow
-```
-
-Known follow-ups:
-
-- no-telemetry watchdog if ffplay stops printing status entirely
-- separate video and audio liveness tracking
-- first-class media health rather than increasingly complex text parsing
-
-## 12. Countdown timing
-
-Visible timers are based on monotonic deadlines rather than worker-loop cadence.
-
-This applies to:
-
-- reconnect countdown
-- warm-up fallback countdown
-- discovery countdown behavior
-
-The UI may add a small polling delay, but countdown values should advance on real second boundaries.
-
-## 13. Logging and observability
-
-### Target modes
-
-#### Normal
-
-- important lifecycle events
-- warnings/errors
-- minimal overhead
-- no external raw output
-
-#### Debug
-
-- structured PGC diagnostics
-- state transitions
-- connection/discovery reasoning
-- process lifecycle
-- recovery/health information
-- no raw external firehose
-
-#### Verbose
-
-- Debug plus raw external output
-- explicit source identity on every line
-- higher I/O cost is acceptable
-
-### Presentation
-
-```text
-Debug:
-[07:50:41.098Z] [STATE]      Playing("carock-pgc.local") | Connected.
-[07:50:52.209Z] [HEALTH]     Active stream transport lost
-
-Verbose:
-[07:50:41.098Z] [PGC]    [STATE]      Playing("carock-pgc.local") | Connected.
-[07:50:54.335Z] [FFPLAY]             ...
-[07:50:54.336Z] [MTX]                ...
-[07:50:54.337Z] [FFMPEG]             ...
-```
-
-Rules:
-
-- UTC/Zulu timestamp
-- millisecond precision
-- dim timestamp
-- stable category/source colours
-- fixed-width fields
-- consistent message start column
-- Debug may omit `[PGC]`
-- Verbose always identifies source
-- redirected output is plain text
-- terminal styling is centralized
-- explicit user actions and final state transitions should be logged so diagnostic history matches observable UI state
-
-Long-term possibility:
-
-- integrated in-app log panel backed by a ring buffer
-
-## 14. Versioning
-
-Three separate compatibility/version concepts:
-
-### Client SemVer
-
-Shared by Client platforms that claim the same feature baseline.
-
-### Host SemVer
-
-Independent Host product lineage.
-
-### Protocol version
-
-Independent wire/discovery compatibility contract.
-
-Product SemVer must not be used as a substitute for protocol compatibility.
-
-Platform build numbers may differ while sharing the same product SemVer.
-
-## 15. Future shared core
-
-A future shared Rust core may own:
-
-- protocol
-- discovery
-- state machine
-- logging
-- media health
-- configuration
-- compatibility rules
-
-Platform shells can remain native where that provides better UX.
+Host and Client remain separate applications and release artifacts. Shared crates/core are encouraged where justified; a unified Host+Client shell is not.

@@ -1,8 +1,8 @@
 # Portable Game Caster Roadmap / Backlog
 
-This backlog is ordered approximately by current priority, not by strict release commitment.
+Ordered approximately by current priority, not strict release commitment.
 
-## Status vocabulary
+Statuses:
 
 - `Planned`
 - `In Progress`
@@ -11,393 +11,279 @@ This backlog is ordered approximately by current priority, not by strict release
 - `UX Approved`
 - `Done`
 
----
-
-## Immediate — Windows Host native FFmpeg ownership
-
-**Status: Done — basic Windows hands-on validation passed; broader stress testing remains useful**
-
-Accepted architecture:
-
-- Host remains lightweight while idle
-- FFmpeg stopped while no viewers exist
-- capture device unopened while idle
-- NVENC idle while idle
-- no gameplay publisher bandwidth while idle
-- MediaMTX provides reader-demand signaling but does not own FFmpeg lifecycle
-- Host directly launches FFmpeg
-- Host retains FFmpeg process handle
-- Host monitors expected/unexpected exit
-- Host restarts FFmpeg while demand remains
-- Host stops FFmpeg when demand ends
-- Host guarantees no more than one owned FFmpeg
-- Host shutdown cleans FFmpeg and MediaMTX
-- no PowerShell/PID-file dependence in the active lifecycle
-- MediaMTX and FFmpeg are assigned to a Host-owned Windows Job Object on a best-effort basis
-
-Current demand signal:
-
-```text
-MediaMTX runOnDemand
--> pgc-host-windows.exe --demand-signal
--> held localhost TCP connection to running Host
--> Host starts/stops FFmpeg
-```
-
-Current teardown is intentionally conservative:
-
-- 10s MediaMTX `runOnDemandCloseAfter`
-- 5s Host no-demand FFmpeg grace
-- approximately 15s from last reader to encoder shutdown, plus graceful FFmpeg exit
-
-Initial real Windows validation showed approximately 35 MB Host idle memory with effectively no CPU/GPU activity, and approximately 240 MB / ~11% GPU while actively streaming on the current prototype system.
-
-Further stress testing remains useful for awkward-timing failure cases, but native Host ownership is now the accepted architecture.
+Planned/future sections describe intent, not current product behavior.
 
 ---
 
-## Immediate — unified Host + Client logging UX / log levels
+## Immediate — unified Host + Client logging
 
-**Status: Planned — next major pass**
+**Status: In Progress — macOS Client UX Approved; Windows Host awaiting native validation. Feature not Done.**
 
-Create one shared logging semantics and presentation model across Host and Client.
+Accepted macOS baseline:
 
-### Modes
+- Quiet / Normal / Debug / Verbose
+- UTC/Zulu millisecond timestamps
+- readable Normal/Debug STATE lines; raw internal state only Verbose
+- 50-character startup header with build channel + SemVer, platform, mode, protocol, session, logs folder
+- plain session files independent of terminal mode
+- active `pgc-client-latest.log`; millisecond archive naming; newest five exact-pattern archives
+- action/final-state breadcrumbs
+- top-right utility shelf + Open Logs Folder (`L`)
+- repeat-safe keyboard handling, no default button, focus follows logical primary slot
+- hover/pressed feedback
+- development-only UI self-test/snapshot support
 
-#### Normal
+Windows Host implementation awaiting native acceptance includes:
 
-- important lifecycle/user-facing events only
-- lowest practical overhead
-- warnings/errors
-- no raw external-process firehose
-- intended production/default mode
+- same conceptual levels/presentation/sinks
+- `[MTX]` / `[FFMPEG]` raw output at Verbose
+- Normal DEMAND / ENCODER / STREAM lifecycle
+- publisher wait/availability and configured media
+- wait warnings at 5 / 15 / 30 seconds
+- unexpected encoder `Cause:` extraction
+- truthful demand-loss wording
+- `L` opens logs folder
 
-#### Debug
+Remaining after Windows validation:
 
-- structured PGC state/lifecycle diagnostics
-- discovery/connection details
-- process ownership/recovery decisions
-- health state
-- event-driven
-- no raw FFmpeg/ffplay/MediaMTX firehose
-
-#### Verbose
-
-- Debug plus raw external output
-- external source identity mandatory
-- greater console I/O/formatting overhead is acceptable
-
-### Presentation
-
-- UTC/Zulu timestamps with millisecond precision
-- timestamp dim/grey in interactive terminals
-- fixed-width columns
-- message text starts at one consistent position
-- stable category colours
-- category colours shared between Host and Client where names overlap
-- Debug may omit redundant `[PGC]`
-- Verbose explicitly labels every source:
-  - `[PGC]`
-  - `[FFPLAY]`
-  - `[FFMPEG]`
-  - `[MTX]`
-  - future sources as needed
-- external output is never ambiguous
-- redirected/file output remains plain text
-- terminal styling centralized
-- preserve timestamped MediaMTX observability
-- restore/preserve useful Host terminal colour
-- prevent FFmpeg carriage-return progress output from visually corrupting structured log lines
-
-Potential PGC categories:
-
-- APP
-- STATE
-- ACTION
-- CONNECT
-- DISCOVERY
-- PLAYER
-- STREAM
-- HEALTH
-- RECONNECT
-- HOST
-- CAPTURE
-- ENCODER
-- DEMAND
+- decide whether Host should adopt Client-style `latest` naming
+- review provisional Host category colors on real console
+- reconcile final Windows findings before merge to `master`
 
 ---
 
-## Immediate — Client action and final-state breadcrumbs
+## Immediate — Windows Host console QuickEdit / click-freeze
 
-**Status: Planned — bundle with unified logging pass**
+**Status: Planned as part of native Windows validation**
 
-The diagnostic timeline must match the actual UI state.
+Observed: clicking/selecting in the classic Windows console can pause apparent Host progress until the selection is released, making healthy functionality look broken.
 
-Add concise Debug breadcrumbs for explicit user actions:
+Required:
 
-- Search
-- Retry
-- Cancel
-- Stop Stream
-- Quit
-- future Synchronize
-- future configuration changes
-
-Also log final state transitions such as:
-
-```text
-[ACTION]     Stop Stream requested.
-[STATE]      Idle | Ready to search.
-```
-
-A log must not end at `Playing | Connected.` when the Client has actually returned to Idle.
-
-Preserve:
-
-- stale-worker invalidation
-- local Stop/Cancel behavior
-- no Client -> Host session-control coupling
+- disable selection-induced suspension programmatically
+- preserve Ctrl+C and `L`
+- degrade safely when no interactive console exists
+- validate idle and streaming while clicking, dragging, double-clicking, and selecting
 
 ---
 
-## Investigate occasional first-stream reader lag / audio warble
+## Immediate — Windows Host portability / capture configuration
 
-**Status: Planned / observe before changing transport settings**
+**Status: Planned — one of the next major milestones**
 
-First real Windows connection after the native Host ownership update produced:
+Remove prototype capture hardcoding.
 
-- distorted/warbly audio
-- MediaMTX `reader is too slow`
-- 1,071 discarded frames
+Initial target:
 
-Immediate subsequent streams were substantially healthier.
+- enumerate Windows video sources
+- enumerate audio sources independently
+- first-run arrow-key selection + Enter confirmation
+- save only after full video+audio confirmation
+- if configured hardware disappears, re-enter configuration while preserving still-valid choices where sensible
+- arbitrary DirectShow capture devices first
+- external capture first
+- portable configuration model that can later support other backends
 
-Do not assume a shader-cache-like mechanism; no such cause has been established.
+Do **not** put bitrate, frame rate, or resolution into initial capture-source configuration. Those belong to later stream-profile/negotiation work.
 
-Investigate whether this correlates specifically with:
-
-- first capture-device open after Host startup
-- FFmpeg/DirectShow warm-up
-- initial MediaMTX buffering/burst behavior
-- ffplay joining behind the live edge
-- initial A/V clock establishment
-
-Do not change buffer/timing parameters without reproducible evidence.
+Likely idle Host shortcut: `S` Settings. Not final until implemented/validated.
 
 ---
 
-## Host resource profiling
+## Immediate / observe — first-stream lag / audio warble
 
-**Status: Planned / low priority**
+**Status: Planned / reproduce before changing transport**
 
-Current prototype baseline from first Windows validation:
+One first connection showed distorted/warbly audio and MediaMTX `reader is too slow` with 1,071 discarded frames. Immediate later streams were healthier.
 
-- idle: ~35 MB RAM, effectively no CPU/GPU use
-- active 1080p60 stream: ~240 MB RAM, ~11% GPU
-
-Later profiling should measure:
-
-- idle CPU wakeups
-- idle GPU activity
-- power impact
-- capture-device/USB or PCIe activity
-- network traffic
-- long-duration active memory behavior
-- effect of Debug and Verbose logging modes
+Investigate correlation with first capture-device open, DirectShow/card warm-up, initial clocks, MediaMTX buffering/burst, ffplay joining behind live edge. Do not retune buffering/timing without reproducible evidence.
 
 ---
 
 ## Client recovery / truthfulness
 
-**Status: Core UX approved; broader soak testing remains**
+**Status: Core UX Approved; soak/health improvements remain**
 
 Accepted:
 
-- Playing only after decoded media confirmed
-- reconnect states only after a healthy Playing state is lost
-- restored RTSP moves to WaitingForStream
-- cold timeout: `Stream did not start.`
-- recovery timeout: `Stream did not resume.`
-- monotonic deadline-driven reconnect countdown
-- monotonic deadline-driven warm-up countdown
-- improved discovery countdown cadence
-- Cancel implemented and UX-approved
-- Stop Stream implemented and UX-approved
-- friendly Host identity header implemented
-- stalled-media watchdog exits Playing after approximately five seconds of frozen ffplay status progress
+- Playing only after decoded media
+- reconnect states only after previously healthy Playing
+- restored RTSP -> WaitingForStream
+- Cancel / Stop / Retry contextual controls
+- monotonic reconnect/warm-up/discovery countdowns
+- same-Host recovery
+- initial frozen-media watchdog
 
 Remaining:
 
-- long healthy-session soak for false-positive stall detection
-- detect ffplay ceasing telemetry entirely
-- distinguish video liveness from audio liveness
-- evolve text-parsed media health into a stronger first-class health model
+- long healthy soak for false positives
+- no-telemetry watchdog
+- separate video/audio liveness
+- first-class media-health model
 
 ---
 
-## Client UI polish
+## Planned first-release — Client Host Browser
 
-**Status: Future / very low priority**
+Current auto-connect behavior should evolve before first release.
 
-- investigate status/message text appearing selected/highlighted after state updates
-- revisit layout, typography, colours, and visual identity once the app's look direction is established
-- avoid spending architecture time on cosmetic polish unless it becomes disruptive
+Direction:
 
----
+- launch into discovery/home screen
+- discover Hosts but do **not** auto-connect
+- user explicitly selects a Host
+- support multiple Hosts naturally
+- Automatic Host Discovery default ON
+- prefer event/service add/remove + expiry rather than aggressive polling
+- when auto discovery is off, explicit Search/Refresh
+- direct-IP escape hatch
 
-## Windows Host portability milestone
+Row direction:
 
-**Status: Planned after native lifecycle ownership**
+```text
+CAROCK                               192.168.0.242
+                         Ready
+```
 
-Remove prototype capture hardcoding.
+Thin full-width clickable row, no separate Connect button. Potential color-coded statuses: Ready, Busy/Streaming, Updating, Capture Source Missing, Incompatible, Unavailable. Exact status/protocol model remains future design.
 
-Host should eventually:
+Direct-IP utility icon likely sits in the top-right utility shelf, left of Logs, on Host Browser only.
 
-- enumerate video capture sources
-- enumerate audio capture sources independently
-- allow selection
-- persist configuration
-- validate unavailable/missing devices
-- surface capture health
-- support arbitrary DirectShow devices
-- support future non-Windows capture backends
-- provide lightweight native Host configuration UI
+### Host Browser tooltip/details
 
-Potential Host controls:
+Hover information should be operationally useful:
 
-- Video source
-- Audio source
-- Encoder
-- Resolution/profile
-- Status
-- Start/stop or service controls where appropriate
+```text
+Host
+Address
+Version
+Protocol
+Video
+Audio
 
----
+Status
+status-specific message
 
-## Encoder/backend support
+Connection: Excellent (20 ms)   # only once real metrics exist
+```
 
-**Status: Planned**
+Use `Connection` or `Network`, not "Connection Strength"; PGC is not measuring RF signal strength.
 
-Profiles/backends:
+Future connection quality may consider RTT, jitter, loss, reconnect stability, etc. Do not claim metrics that do not exist.
 
-- modern NVIDIA
-- Pascal/legacy NVIDIA
-- Intel QSV
-- AMD AMF
-- x264 fallback
+Tooltip should be able to update while open. A dim hint such as `See More Detailed Host Info — Hold Option` may reveal an info affordance/dense Host Info modal.
 
-Investigate:
-
-- compatible FFmpeg distribution strategy
-- legacy vs modern NVIDIA requirements
-- runtime encoder capability detection
-- fallback ordering
-- licensing/distribution considerations
-
-Prefer profile selection over separate Host builds.
+A reusable custom tooltip/popover system is backlog because native tooltip timing/content is too limited for live rich Host Browser information.
 
 ---
 
-## Real media-flow health
+## Planned first-release — native macOS menu
 
-**Status: Incremental / ongoing**
+Application menu direction:
 
-Differentiate:
+- About Portable Game Caster
+- Check for Updates…
+- Settings… later
+- standard macOS Hide/etc.
+- Quit Cmd+Q
 
-- process alive
-- relay reachable
-- transport alive
-- publisher alive
-- video advancing
-- audio advancing
-- network healthy
+Stream menu should be state-aware: Search/Refresh when idle, Cancel while connecting/reconnecting, Stop Stream while Playing, future Mute/Synchronize.
 
-Future Host health should distinguish:
+Help menu direction:
 
-- capture failure
-- encoder failure
-- publisher failure
-- MediaMTX failure
-- network/client failure
+- Open Logs Folder (`L`)
+- Relaunch in Debug Mode
+- Relaunch in Verbose Mode
+- future Help / GitHub / Report Issue
 
-Future Client health should support:
-
-- video frame progress
-- audio progress
-- last-media timestamp
-- stalled video
-- missing audio
-- degraded transport/network
+Manual GitHub Releases update check is sufficient initially; no background updater required for first pass.
 
 ---
 
-## Client stream UX
+## Planned first-release — in-app diagnostic log viewer
 
-**Status: Planned**
+Normal mode: **absent** from layout entirely.
 
-Connected-state stream information:
+Debug: live Debug log visible.
 
-- duration
-- bitrate
-- resolution
-- frame rate
-- useful connection/network health
+Verbose: live Verbose log visible.
 
-Future controls:
+Requirements when visible:
 
-- `Synchronize`
-  - return playback to freshest safe live edge
-  - avoid audio warping/stuttering
-- dedicated PGC player wrapper/window
-- useful player title:
-  - `Portable Game Caster Stream — <hostname>`
-- native macOS power assertion during active playback
+- never miss events
+- read-only/selectable native text
+- monospace scroll view
+- Copy / Cmd+C / Select All
+- follow tail only when already at bottom
+- scrolling upward disables forced autoscroll
+
+Collapse/expand behavior is intentionally undecided.
 
 ---
 
-## Client discovery robustness
+## Host console / TUI direction
 
-**Status: Planned**
+**Status: Future UX direction**
 
-- investigate rare immediate re-search misses
-- test rapid Stop Stream -> Search cycles
-- potentially retry/reuse mDNS browse before surfacing failure
-- preserve distinction:
-  - no service found
-  - service found but address unresolved
-- multiple-Host selection
-- preferred Host memory/selection behavior
+Host remains a lightweight console application; no dedicated GUI is currently desired.
+
+Prefer a restrained custom terminal UI over immediately adopting a heavyweight ncurses-style/full-screen framework:
+
+```text
+logs scroll above
+-----------------
+S Settings   L Logs   H Help   Ctrl+C Quit
+```
+
+Footer/legend may change with state. `H` could expand upward and reduce log runway. Adopt a real TUI library only if custom redraw/resize/focus complexity justifies it.
 
 ---
 
-## Dependency validation
+## Logging implementation / performance
 
-**Status: Planned**
+**Status: Future architecture-audit/refactor consideration**
 
-### Host
+Current logging is synchronous. Consider later:
 
-Detect and explain:
+```text
+producer threads -> bounded event queue -> one logging worker -> terminal/file/UI sinks
+```
 
-- MediaMTX missing
-- FFmpeg missing
-- invalid executable path
-- launch failure
-- unsupported FFmpeg/NVENC combination
-- bad MediaMTX config
-- missing capture device
-- missing audio device
+Goals: never block media/supervision on slow disk/terminal, no thread-per-message, no unbounded queue, preserve critical structured events, allow pathological raw Verbose chatter to be throttled/dropped if necessary.
 
-### Client
+Do not build this without evidence or as pre-emptive optimization.
 
-Detect and explain:
+Hardening backlog: active `pgc-client-latest.log` manually deleted during a running session.
 
-- ffplay missing
-- Homebrew missing
-- ffmpeg-full missing
-- invalid `PGC_FFPLAY_PATH`
-- player launch failure
+---
 
-Diagnostics should explain paths searched and why startup failed.
+## Pre-release architecture / shared-core audit
+
+**Status: Planned before first public release**
+
+Use the strongest available coding/reasoning model. First pass analysis-only.
+
+Audit:
+
+- duplication and shared invariants encoded separately
+- overly broad modules
+- platform leakage
+- dead/stale code
+- ownership/coupling
+- unnecessary allocations/copies/polling
+- meaningful performance issues
+- shared-crate opportunities
+- harmful/premature abstractions
+- rationale/archaeology gaps
+
+Classify findings:
+
+- Low-risk / high-value
+- Medium-risk
+- Architectural
+- Defer
+
+Likely candidates to review: logging, protocol/versioning, discovery constants/TXT parsing, configuration models, platform/build metadata. Do not abstract merely because two files look similar.
 
 ---
 
@@ -405,201 +291,159 @@ Diagnostics should explain paths searched and why startup failed.
 
 **Status: Planned**
 
-Policy exists in `PGC-VERSIONING.md`.
+Policy is in `PGC-VERSIONING.md`.
 
-Implementation:
+Implement:
 
 - independent Client SemVer
 - independent Host SemVer
 - independent protocol version
 - platform build/revision numbers
-- macOS version metadata
+- macOS metadata mappings
 - Windows product/file metadata
-- About/debug output:
-  - version
-  - build
-  - platform
-  - protocol
-- evolve mDNS TXT:
-  - from `version=1`
-  - toward explicit `protocol_version=1`
+- About/debug/startup output
+- explicit `protocol_version` discovery metadata when appropriate
 
-The first complete pass of the versioning system is a candidate milestone for the first `master` -> `main` pull request.
+Build channels: Development / Nightly / Beta / Release. They are provenance, not compatibility. Do not infer channel from branch until the versioning pass deliberately defines that behavior.
 
 ---
 
-## GitHub Releases / distribution pipeline
+## Release structure / packaging
 
-**Status: Planned — begin manually, automate after conventions are proven**
+**Status: Planned**
 
-GitHub Releases should become the normal public distribution surface for precompiled PGC builds once versioning and packaging are ready.
-
-Initial/manual phase:
-
-- create releases by hand to learn the desired workflow
-- prepare platform packages manually at first
-- attach precompiled Host/Client artifacts
-- establish artifact naming conventions
-- establish release-note structure
-- establish checksum/signing expectations where appropriate
-- verify how independent Host/Client SemVer should map to tags and release pages before locking in automation
-
-Release intent:
-
-- published builds should have passed hands-on baseline functionality and stability testing
-- SemVer maturity should align with GitHub prerelease/full-release intent
-- alpha/beta/otherwise unstable milestones should be GitHub prereleases
-- stable public versions should use normal GitHub releases
-- do not publish every development commit as a release
-
-Future GitHub Actions automation:
-
-- build all supported target-platform artifacts
-- run appropriate automated tests/checks per platform
-- package executables/apps and required runtime files
-- generate checksums and other release metadata
-- create or populate GitHub Releases
-- upload release assets automatically
-- scale the matrix as Windows, macOS, Linux, Steam Deck, mobile, and other supported platforms are added
-
-Desired long-term shape:
+Keep Host and Client as separate downloadable applications by role/platform, for example:
 
 ```text
-validated version/tag
--> GitHub Actions matrix
--> build/test/package each supported platform
--> create release assets
--> publish GitHub prerelease/release
+PGC-Host-Windows-x64
+PGC-Client-Windows-x64
+PGC-Client-macOS-arm64
 ```
 
-Do not automate release/tag structure until the first manual releases establish what users and maintainers actually need.
+Names are illustrative until manual releases establish conventions.
+
+Manual releases first to learn artifact names, tags, release-note structure, checksums/signing expectations, and independent Host/Client version behavior. Automate with GitHub Actions later.
+
+Windows packaging eventually needs Host, MediaMTX, compatible FFmpeg, discovery/service setup, firewall/config, dependency preflight, capture-source selection, and background startup.
+
+macOS should eventually remove Homebrew as a hard runtime dependency where licensing/distribution permits.
 
 ---
 
-## Packaging / installation
+## First public release milestone
 
-**Status: Planned**
+The first meaningful `master -> main` PR should represent an intentionally structured public release milestone, after:
 
-### Windows
+- Host portability/capture-source baseline
+- pre-release architecture/shared-core cleanup
+- versioning
+- first-release Client UX
+- packaging
+- hands-on stability validation
+- documentation/release review
 
-Installer/package should eventually handle:
+Before that release, update repository description/README opening/Quick Start/download-install/supported-platform framing.
 
-- PGC Host
-- MediaMTX
-- compatible FFmpeg
-- discovery/service setup
-- firewall/configuration
-- dependency validation
-- capture-device selection
-- background startup
+Working explanation:
 
-### macOS
+> Portable Game Caster turns a capture device connected to one computer into a lightweight, discoverable LAN video source another device can watch locally.
 
-Eventually remove Homebrew as a hard runtime dependency where licensing/distribution permits by bundling or managing playback dependencies.
+Gaming is the flagship use case, but the underlying idea is local casting of arbitrary captured video.
 
-Packaging work should converge with the GitHub Releases/Actions pipeline so release artifacts are reproducible rather than hand-assembled indefinitely.
+Product wedge:
 
----
-
-## Background/service lifecycle
-
-**Status: Planned**
-
-- proper Windows background service/helper
-- startup at login/system startup
-- clean child-process ownership
-- low idle footprint
-- dependency preflight
-- clean shutdown
-- user-visible status/control surface where appropriate
+- LAN-first
+- capture-first
+- viewing rather than remote control
+- commodity hardware
+- demand-driven low idle footprint
+- compressed / Wi-Fi-friendly
+- automatic discovery
+- lightweight dedicated Host and Client
+- cross-platform direction
+- no cloud/account requirement
+- no OBS workflow requirement
 
 ---
 
-## Latency
+## Licensing / commercial boundary
 
-**Status: Planned optimization**
+**Status: Undecided — resolve before first meaningful public release**
 
-- reduce end-to-end latency further
-- current MediaMTX relay adds roughly ~0.5 seconds compared with prior direct point-to-point testing
-- preserve stable current transport until a clearly better option is demonstrated
-- do not trade reliability for marginal latency improvements
+- current GPL-3.0-only choice was provisional
+- current preference is free/source-visible community/home use while reserving commercial application/use
+- PolyForm Noncommercial is a conceptual candidate; that would be source-available, not OSI open source
+- no final license decision yet; `LICENSE` unchanged
+- contributor/relicensing strategy must be decided before outside contributions under a commercial dual-track model
+- legal/IP structure requires professional legal review
 
----
-
-## Teardown grace tuning
-
-**Status: Deferred optimization**
-
-Current last-reader-to-FFmpeg-stop delay is intentionally about 15 seconds:
-
-- 10s MediaMTX demand close-after
-- 5s Host encoder grace
-
-This is longer than the old lifecycle but currently stable.
-
-Only shorten it after rapid reconnect/recovery testing demonstrates that doing so does not reintroduce encoder thrash or recovery races.
+The community repo is not the commercial/event-product roadmap. Private commercial/event planning belongs separately and should not leak into public roadmap/business details.
 
 ---
 
-## Known stream cleanup items
+## Validation infrastructure
 
-**Status: Deferred**
+**Status: Planned — high priority after first release**
 
-- SRT ACKACK noise
-- cold-start H.264 PPS warnings
-- cold-source startup polish
+Desired model:
 
-Do not reintroduce RTSP ingest unless a fundamentally new approach addresses the prior DirectShow backpressure/choppiness problem.
+- GitHub Actions / CI for generic build/unit checks
+- MCP-style or self-hosted real-machine validation for Windows/Linux/macOS
+- hardware-aware checks for capture devices, NVENC, process lifecycle, etc.
+- remote driver can request validation without using a Git commit merely as transport
 
----
-
-## Code archaeology / maintainability pass
-
-**Status: Future / low priority**
-
-Treat code comments and commit history as archaeological documentation for future maintainers.
-
-Future cleanup should:
-
-- add comments where rationale is not obvious from code
-- document why non-obvious constraints exist, not merely restate syntax
-- preserve important failed-experiment context near sensitive code where useful
-- improve names/module boundaries where they obscure intent
-- remove stale comments when architecture changes
-- prefer comments that remain understandable years later without requiring conversational context
-
-Do not blanket-comment obvious code; prioritize decisions, invariants, workarounds, platform quirks, and failure-mode reasoning.
+CI complements real-hardware validation; it does not replace it.
 
 ---
 
-## Recording / archival
+## Resource profiling
 
-**Status: Planned**
+**Status: Planned / low priority**
 
-- archival recording
+Later measure idle CPU wakeups, GPU activity, power, USB/PCIe/capture activity, network traffic, long-duration memory behavior, and Debug/Verbose logging cost.
+
+Prototype informal baseline: idle ~35 MB, active ~240 MB / ~11% GPU.
+
+---
+
+## Stream / Client future controls
+
+Planned or future:
+
+- local Client Mute (local playback only; do not affect Host/other viewers/Discord capture semantics inadvertently)
+- Synchronize / return to freshest safe live edge
+- stream information (resolution/rate/bitrate/health where available)
+- dedicated PGC player wrapper/title
+- native macOS power assertion while playing
+- stronger network/connection health model
+
+---
+
+## Dependency / preflight
+
+Host should detect/explain missing MediaMTX, FFmpeg, bad executable path, unsupported FFmpeg/NVENC, bad config, missing capture/audio devices.
+
+Client should detect/explain missing ffplay/Homebrew/ffmpeg-full today and future packaged dependency failures.
+
+Diagnostics should say paths searched and why startup failed.
+
+---
+
+## Recording / hardware expansion
+
+Future:
+
+- archival recording independent from live profile
 - simultaneous live + archival capture
 - AVerMedia GC575 integration
-- surround audio capture strategy
-- archival quality profiles independent from live stream profile
-
----
-
-## Hardware/audio expansion
-
-**Status: Future**
-
-- AVerMedia Live Gamer 4K 2.1 / GC575
-- PC Line In audio path where needed
-- surround audio
-- HDMI/AVR compatibility matrix
-- additional AVR configurations
+- PC Line In / surround-audio strategy
 - capture-card health/wake handling
 
 ---
 
 ## Platform expansion
 
-**Status: Future**
+Future:
 
 - Windows Client
 - Linux Client
@@ -607,27 +451,9 @@ Do not blanket-comment obvious code; prioritize decisions, invariants, workaroun
 - Steam Deck
 - macOS Host where useful
 - Android
-- iOS / iPadOS
+- iOS/iPadOS
 
-Shared product SemVer should only be claimed where feature parity is real.
-
----
-
-## Documentation system
-
-**Status: Active**
-
-Repository docs are canonical shared project memory.
-
-Workflow:
-
-- decisions recorded in DECISIONS when durable
-- roadmap state maintained continuously enough to remain useful
-- implementation reports flag documentation impact
-- documentation updates may be consolidated across several tickets within one working branch
-- accepted feature branches receive a documentation reconciliation before merge into `master`
-- `master` receives a broader documentation/release review before milestone merges into `main`
-- code and documentation should be committed together when practical
+Shared SemVer should only be claimed where feature/behavior parity is real.
 
 ---
 
@@ -635,52 +461,39 @@ Workflow:
 
 **Status: Active**
 
-Current intended branch roles:
+Working branches should use frequent focused ticket commits after engineering validation. Those commits preserve implementation history; they do not claim acceptance.
 
-- `main`: stable milestone/release baseline
-- `master`: integrated, hands-on accepted development state
-- short-lived `feature/*`, `fix/*`, `refactor/*`, and `spike/*` branches: active work
+Hands-on/native validation defines platform/feature acceptance. Larger platform checkpoint commits can carry richer archaeological summaries. Accepted feature branches receive a documentation reconciliation before merge/PR into `master`.
 
-Working branches may contain frequent commits and iterative/destructive changes. Once a feature set is accepted:
+Branch scope should remain coherent. If adjacent work becomes an independently reviewable feature/fix, changes another product area, deserves its own acceptance/release-note story, or begins to dominate the branch, spin it into a sibling/follow-on branch rather than letting the current branch become a generic improvement bucket.
 
-```text
-working branch
--> documentation sync
--> merge/PR into master
--> delete working branch
-```
+Current logging branch taught this lesson: some Mac interaction improvements were useful and accepted, but a future similarly coherent UX expansion should likely move to a branch such as `feature/client-ux-improvements` rather than continuing indefinitely under a logging branch.
 
 At larger stable milestones:
 
 ```text
-master
--> project-level review
--> PR into main
+master -> project-level review -> PR into main
 ```
-
-The first completed versioning pass is a candidate for the first substantial `master` -> `main` milestone.
 
 ---
 
 ## Completed / accepted foundations
 
 - native macOS AppKit Client shell
-- macOS mDNS discovery
-- same-host reconnect behavior
-- Windows native mDNS advertiser
-- Windows MediaMTX supervisor
-- Windows machine-wide single-instance guard
+- macOS mDNS discovery and same-Host recovery
+- truthful state model / WaitingForStream semantics
+- contextual Cancel / Stop / Retry controls
+- deadline-driven countdowns
+- ffplay metadata parsing and initial stalled-media watchdog
+- Windows native mDNS advertiser / MediaMTX supervisor
+- Windows singleton guard
 - native Windows Host FFmpeg lifecycle ownership
 - demand-signal helper architecture
-- Windows Job Object child containment
+- Job Object containment
 - demand-driven no-encoder idle state
-- truthful Client state model
-- WaitingForStream semantics
-- contextual Cancel / Stop Stream / Retry controls
-- friendly persistent Host identity
-- deadline-driven countdowns
-- Client UTC millisecond timestamps
-- ffplay stream metadata parsing
-- initial stalled-media watchdog
-- source-verified diagnosis of MediaMTX runOnDemand demand-model mismatch
-- best-effort wider Windows Host console
+- source-verified MediaMTX demand-model diagnosis
+- macOS Client unified logging/session files/readable STATE breadcrumbs
+- macOS utility shelf, Logs shortcut, interaction hover/pressed feedback
+- macOS keyboard/focus model and development UI self-test
+
+Not yet accepted/completed: Windows Host side of the unified logging/console transition.

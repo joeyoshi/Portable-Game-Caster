@@ -1,20 +1,16 @@
 # Portable Game Caster Decision Log
 
-This file preserves durable product and architecture decisions and, most importantly, why they were made.
+This file preserves durable product, architecture, and development-process decisions and why they were made. It is not a changelog.
 
-It is not a changelog.
-
-Implementation details belong in `PGC-DEV-NOTES.md`. Future work belongs in `PGC-ROADMAP.md`. Current accepted architecture belongs in `PGC-ARCHITECTURE.md`.
+Implementation facts and landmines belong in `PGC-DEV-NOTES.md`. Future work belongs in `PGC-ROADMAP.md`. Current accepted architecture belongs in `PGC-ARCHITECTURE.md`.
 
 ---
 
-## 2026-09 — PGC is a local broadcast/listener system
+## 2026-09 — Portable Game Caster is a local broadcast/listener system
 
 ### Decision
 
-Portable Game Caster is fundamentally a local-network broadcast/listener architecture.
-
-Clients consume a Host stream without tightly owning Host sessions.
+Clients consume a local Host stream without tightly owning Host sessions.
 
 ### Rationale
 
@@ -22,52 +18,28 @@ The stream may have multiple readers and should behave more like tuning into a l
 
 ### Implications
 
-- Client Stop Stream is local.
-- Client Cancel is local.
-- No Client -> Host cancel message is required.
-- Host lifecycle should not depend on one Client's UI state.
+- Client Stop Stream and Cancel are local.
+- Host lifecycle does not depend on one Client UI state.
+- No Client -> Host cancel/session message is required.
 - Multiple Clients should eventually be possible.
 
 ---
 
-## 2026-09 — SRT publisher -> MediaMTX -> RTSP Client remains the working transport topology
+## 2026-09 — SRT publisher -> MediaMTX -> RTSP/TCP Client is the working transport topology
 
 ### Decision
 
-Use:
-
 ```text
-FFmpeg
--> SRT localhost
--> MediaMTX
--> RTSP/TCP LAN
--> Client
+FFmpeg -> SRT localhost -> MediaMTX -> RTSP/TCP LAN -> Client
 ```
 
 ### Rationale
 
-Direct SRT playback worked but created protocol/logging behavior that was less desirable.
-
-RTSP ingest into MediaMTX was experimentally worse for capture stability.
-
-The current SRT-publish / RTSP-read split is the best tested combination.
-
-### Rejected alternatives
-
-RTSP/TCP ingest:
-
-- severe DirectShow backpressure
-- choppy playback
-
-RTSP/UDP ingest:
-
-- packet loss
-- invalid FU-A behavior
-- choppy playback
+Direct SRT playback was less desirable operationally, while RTSP ingest into MediaMTX produced capture/backpressure and packet-loss problems. The SRT-publish / RTSP-read split is the best tested topology.
 
 ### Implication
 
-Do not casually reintroduce RTSP ingest without a fundamentally new approach.
+Do not casually reintroduce RTSP ingest without a fundamentally different solution.
 
 ---
 
@@ -75,156 +47,61 @@ Do not casually reintroduce RTSP ingest without a fundamentally new approach.
 
 ### Decision
 
-The Client may enter `Playing` only after actual decoded media flow has been confirmed.
+Client may enter `Playing` only after actual decoded media flow is confirmed.
 
 ### Rationale
 
-A reachable RTSP server, an open socket, or a running ffplay process can all exist while no usable media is flowing.
-
-User-facing state must describe reality.
-
-### Implication
-
-The Client uses a distinct `WaitingForStream` state after connectivity is restored but before media is confirmed.
+A reachable RTSP server, open socket, or running player can all exist while no usable media is flowing. User-facing state must describe reality.
 
 ---
 
 ## 2026-09 — Fresh connection and recovery states are distinct
 
-### Decision
+Fresh/cold attempts never use reconnect states. Reconnect states are reserved for recovery after a previously healthy Playing session.
 
-Fresh/cold connection attempts never use reconnect states.
-
-`ReconnectingStream` and `ReconnectingHost` are reserved for recovery after a previously healthy Playing session.
-
-### Rationale
-
-"Reconnecting" implies that something previously worked.
-
-Using reconnect language on first connection is misleading.
+"Reconnecting" should only appear when something actually worked before.
 
 ---
 
-## 2026-09 — Cancel and Stop Stream are explicit local session controls
+## 2026-09 — Cancel and Stop Stream are explicit local controls
 
-### Decision
+Contextual Client controls are Search, Cancel, Stop Stream, Retry, and Quit.
 
-Client controls are contextual:
-
-- Search
-- Cancel
-- Stop Stream
-- Retry
-- Quit
-
-### Rationale
-
-Users need immediate control over long connection/recovery operations without having to quit the app.
-
-### Implications
-
-Cancel:
-
-- returns to Idle
-- invalidates stale worker messages
-- kills race-started ffplay
-
-Stop Stream:
-
-- kills ffplay
-- returns to Idle
-- does not enter reconnect
+Cancel immediately returns to Idle, invalidates stale worker messages, and kills any race-started player. Stop Stream terminates playback and returns to Idle without triggering recovery.
 
 ---
 
-## 2026-09 — One Host process per machine
+## 2026-09 — One Host process per Windows machine
 
-### Decision
-
-Only one PGC Host may run on a Windows machine.
-
-### Implementation identity
+Only one Host may run per machine.
 
 ```text
 Global\PortableGameCasterHost.v1
 ```
 
-### Rationale
-
-Multiple Host supervisors on one machine would compete for MediaMTX ports, capture hardware, discovery identity, and child-process ownership.
-
-### Important distinction
-
-Multiple PGC Hosts on the same LAN are valid.
-
-The mutex name is a singleton-contract identifier, not Host SemVer.
+The mutex name identifies the singleton contract, not Host SemVer. Multiple Hosts on one LAN remain valid.
 
 ---
 
 ## 2026-10 — Client media health must detect frozen media
 
-### Decision
-
 A Client cannot remain Playing indefinitely simply because ffplay and RTSP remain alive.
 
-### Rationale
+Current interim health ignores the `-sync ext` master clock and watches the remaining ffplay status. Roughly five seconds without non-master progress triggers recovery.
 
-Testing showed that ffplay can stay open and continue printing status while the actual source is frozen.
-
-### Interim implementation
-
-After MediaStarted:
-
-- ignore the `-sync ext` master clock
-- monitor the remaining ffplay status fields
-- approximately five seconds of no change triggers recovery
-
-### Known limitations
-
-Future health work should detect:
-
-- no ffplay telemetry at all
-- video-only freeze while audio continues
+Known future gaps: no-telemetry detection and video/audio liveness separation.
 
 ---
 
 ## 2026-10 — Visible countdowns are deadline-driven
 
-### Decision
-
-Reconnect, warm-up, and discovery countdowns derive from monotonic deadlines.
-
-### Rationale
-
-Loop-based countdown values were distorted by network probes, mDNS calls, and worker scheduling.
-
-### Implication
-
-Do not derive visible countdown cadence from worker-loop iteration timing.
+Reconnect, warm-up, and discovery countdowns derive from monotonic deadlines rather than worker-loop cadence so network/mDNS work cannot distort visible seconds.
 
 ---
 
 ## 2026-10 — UTC/Zulu is the canonical diagnostic timestamp
 
-### Decision
-
-PGC diagnostics use UTC/Zulu timestamps with millisecond precision.
-
-Example:
-
-```text
-[07:23:18.492Z]
-```
-
-### Rationale
-
-Host and Client may be on separate machines and future users may share logs remotely.
-
-Universal timestamps make cross-machine correlation direct and unambiguous.
-
-### Implication
-
-Do not convert logs to local wall-clock time merely for familiarity.
+PGC diagnostics use UTC/Zulu with millisecond precision so Host and Client logs from different machines can be correlated directly.
 
 ---
 
@@ -232,7 +109,7 @@ Do not convert logs to local wall-clock time merely for familiarity.
 
 ### Decision
 
-The Host must not keep FFmpeg/capture/NVENC active simply because the Host process is running.
+The Host must not keep FFmpeg, capture hardware, or NVENC active merely because the Host process is running.
 
 ### Idle target
 
@@ -247,49 +124,23 @@ publisher traffic: none
 
 ### Rationale
 
-PGC should be effectively unnoticeable when nobody is watching.
+PGC should be effectively unnoticeable when nobody is watching. A few seconds of first-stream startup is an acceptable trade.
 
-An always-on encoder would unnecessarily consume:
-
-- capture-card/USB or PCIe bandwidth
-- CPU memory bandwidth
-- GPU/NVENC resources
-- power
-- local network/media pipeline activity
-
-A few seconds of startup is acceptable.
-
-### Implication
-
-An always-on publisher is not an acceptable simplification of Host lifecycle.
-
-### Validated outcome
-
-Initial Windows hands-on validation of the native Host architecture measured roughly 35 MB RAM with effectively no CPU/GPU activity while idle. The demand-driven requirement remains justified and practical.
+Initial Windows validation supported this requirement: roughly 35 MB idle memory with effectively no CPU/GPU use on the prototype machine.
 
 ---
 
-## 2026-10 — MediaMTX should not own FFmpeg lifecycle
+## 2026-10 — MediaMTX does not own FFmpeg lifecycle
 
 ### Decision
 
-Move FFmpeg ownership into the native Rust Host.
-
-MediaMTX remains relay/demand infrastructure.
+Native Rust Host owns FFmpeg; MediaMTX remains relay and demand infrastructure.
 
 ### Rationale
 
-Source inspection of MediaMTX 1.21.1 confirmed that its runOnDemand demand model does not match PGC's recovery semantics.
+MediaMTX 1.21.1 source inspection showed that waiting DESCRIBE requests are not active readers and close-after can expire while a recovering Client is still waiting. Those semantics do not provide the lifecycle ownership guarantees PGC needs.
 
-In particular:
-
-- a waiting DESCRIBE is not counted as a reader
-- close-after may expire while the Client is still waiting
-- publisher-loss/recovery semantics do not provide the ownership guarantees PGC needs
-
-These are not merely PowerShell bugs.
-
-### Accepted architecture
+### Accepted model
 
 ```text
 RTSP reader demand
@@ -298,64 +149,22 @@ RTSP reader demand
 -> held localhost connection to running Host
 -> Host starts/owns FFmpeg
 -> FFmpeg publishes SRT to MediaMTX
--> MediaMTX serves RTSP reader
+-> MediaMTX serves RTSP readers
 ```
 
-The demand helper exists only to translate MediaMTX reader demand into a Host-visible signal. It does not own FFmpeg.
-
-### Why this preserves the product model
-
-- arbitrary compatible RTSP readers can still create demand
-- no PGC Client -> Host session-control protocol is required
-- Host remains authoritative over encoder lifecycle
-- FFmpeg can restart while demand remains without requiring MediaMTX to relaunch the encoder
-
-### Implication
-
-Do not return FFmpeg launch/stop ownership to MediaMTX scripts merely because `runOnDemand` still appears in the configuration. Its role is demand signaling only.
+Do not return FFmpeg ownership to MediaMTX scripts merely because `runOnDemand` remains in the configuration.
 
 ---
 
 ## 2026-10 — PID files and PowerShell are not the active ownership model
 
-### Decision
-
-Native Host FFmpeg ownership uses direct child/process handles.
-
-PowerShell start/stop scripts and PID-file ownership are legacy/deprecated.
-
-### Rationale
-
-PID files are useful diagnostics but fragile as the authority for process ownership.
-
-Potential problems include:
-
-- stale PID
-- PID reuse
-- start/stop ordering races
-- ownership ambiguity
-
-Direct Host process ownership is clearer and enables intentional restart, shutdown, and failure handling.
-
-### Implication
-
-Legacy scripts may remain temporarily for archaeological/reference value, but active architecture must not silently drift back to them.
+Native Host owns child/process handles directly. Old PowerShell start/stop scripts and PID-file ownership are legacy/deprecated and may remain only for archaeological/reference value.
 
 ---
 
 ## 2026-10 — Host-owned child processes use Windows Job Object containment
 
-### Decision
-
-The Windows Host should assign MediaMTX and FFmpeg to a kill-on-close Windows Job Object on a best-effort basis.
-
-### Rationale
-
-If the Host is hard-killed, its child infrastructure should not remain orphaned and continue holding ports, capture hardware, or encoder resources.
-
-### Implication
-
-Job Object assignment failure may currently warn rather than fail Host startup, but hard-kill cleanup remains part of the Host regression matrix.
+MediaMTX and FFmpeg should be assigned to a kill-on-close Job Object on a best-effort basis so abnormal Host termination does not leave owned infrastructure behind.
 
 ---
 
@@ -363,168 +172,135 @@ Job Object assignment failure may currently warn rather than fail Host startup, 
 
 ### Decision
 
-Host and Client should share the same conceptual logging modes and console presentation.
+Host and Client share Quiet / Normal / Debug / Verbose semantics and a common presentation model.
 
-### Modes
-
-Normal:
-
-- important lifecycle only
-- low overhead
-- no raw external output
-
-Debug:
-
-- structured PGC diagnostics
-- event-driven
-- practical for troubleshooting
-
-Verbose:
-
-- Debug plus raw external sources
-- explicit source identity on every line
+- Quiet: terminal silent; support/session log still written.
+- Normal: important lifecycle/user-facing production diagnostics.
+- Debug: structured event-driven internal diagnostics, no raw subprocess firehose.
+- Verbose: Debug plus raw external provenance and deeper internal decision details.
 
 ### Presentation
 
-Debug:
+- UTC/Zulu millisecond timestamps
+- stable fixed-width source/category fields
+- readable STATE lines at Normal/Debug
+- raw internal state only at Verbose
+- no ANSI in files/redirects
+- Verbose always identifies source
+- explicit user actions and final state transitions leave breadcrumbs
 
-```text
-[timestamp] [CATEGORY]    message
-```
+### Status
 
-Verbose:
+macOS Client side is UX Approved. Windows Host side is implemented and awaiting native Windows validation on `feature/host-client-logging`.
 
-```text
-[timestamp] [SOURCE] [CATEGORY]    message
-```
+---
 
-External source example:
+## 2026-10 — Observability and smoke tests are part of feature delivery
 
-```text
-[timestamp] [FFPLAY]               message
-[timestamp] [FFMPEG]               message
-[timestamp] [MTX]                  message
-```
+Every feature should decide what its new user actions, state transitions, failure paths, and background subsystems log at Normal, Debug, and Verbose.
 
-### Rationale
-
-Logs should be visually scannable and never ambiguous about who produced a line.
-
-### Styling rules
-
-- timestamps dim/grey
-- category/source colours stable
-- fixed-width fields
-- message text aligned
-- no ANSI in redirected output
-- Debug may omit redundant `[PGC]`
-- Verbose always includes explicit provenance
-- explicit user actions and final state changes should be logged so the diagnostic history represents the UI's actual state
+Development-only smoke-test tools are encouraged when they reduce otherwise unverifiable behavior, stay contained, do not alter production behavior, and are compiled/kept out of production where appropriate. They never replace hands-on UX acceptance.
 
 ---
 
 ## 2026-10 — Repository documentation is canonical shared project memory
 
-### Decision
+Repository docs are the shared reference point for the user/product owner, ChatGPT, coding agents, and future contributors.
 
-Repository documentation is the shared reference point for:
-
-- user/product owner
-- ChatGPT
-- coding agents
-- future contributors
-
-### Workflow
-
-1. Decisions may be recorded immediately.
-2. Experimental code does not automatically become architecture.
-3. Every coding report assesses documentation impact.
-4. Approved implementation updates Architecture and Dev Notes.
-5. Roadmap reflects priority/status continuously enough to remain useful.
-6. Documentation updates may be consolidated across several implementation tickets and synchronized at meaningful branch/milestone checkpoints.
-7. Prefer committing accepted code and documentation together when practical.
-
-### Rationale
-
-The project has grown beyond what should live only in conversational memory.
-
-Updating every canonical document after every small ticket would create unnecessary churn, while waiting too long risks divergence.
-
-### Implication
-
-A milestone is not considered fully synchronized until its documentation impact has been reviewed. Accepted working branches should receive a documentation reconciliation before merge into `master`, and `master` should receive a broader project-level review before milestone merges into `main`.
+Implementation reports flag documentation impact. Documentation may be consolidated over several small tickets, but accepted working branches must be reconciled before merge into `master`, and `master` gets a broader review before promotion to `main`.
 
 ---
 
 ## 2026-10 — Commit messages and code comments are archaeological documentation
 
+Commit history and non-obvious comments should let a future maintainer reconstruct what changed, why, what it replaced, and what constraints mattered without access to the original conversation.
+
+Small ticket commits can be concise. Larger platform acceptance, architectural transition, and integration commits should carry richer rationale.
+
+---
+
+## 2026-10 — Working branches use frequent focused commits; acceptance is a separate checkpoint
+
 ### Decision
 
-Commit messages and non-obvious code comments should be written for a future maintainer who may encounter the project years or decades later without access to the original conversation.
+Working branches should preserve progress with frequent, focused commits after engineering validation. One completed ticket will often map to one commit.
+
+A ticket commit records that an implementation checkpoint built/tested as reported. It is not proof that UX, hardware behavior, or the whole feature has been accepted.
+
+Hands-on/native validation remains required before the relevant platform or feature is considered accepted and before merge into `master`.
+
+Agents may commit only when the current ticket/workflow explicitly permits it. Feature-branch context alone is not permission.
 
 ### Rationale
 
-History is most valuable when it explains what changed, why it changed, what it replaced, and which constraints motivated the choice.
+Short-lived branches exist partly to make incremental history cheap and useful. Avoiding commits until the end produces oversized changes that are harder to review, bisect, and understand. If hands-on testing finds a defect, a later fix commit is healthy history rather than evidence that the earlier checkpoint should never have existed.
 
-Opaque shorthand such as "stabilize lifecycle" loses value over time.
+### History levels
 
-A better commit subject names the architectural transition directly, for example:
-
-```text
-Replace MediaMTX/PowerShell FFmpeg lifecycle with native Host control and strengthen client recovery
-```
-
-### Implications
-
-Future cleanup should:
-
-- comment rationale, invariants, workarounds, and platform quirks where they are not obvious
-- avoid comments that merely restate syntax
-- keep comments current as architecture changes
-- write commit subjects/bodies that can reconstruct intent without conversational context
+1. **Ticket commit** — small, focused, concise.
+2. **Platform/acceptance checkpoint** — richer archaeological summary after native/hands-on validation.
+3. **Feature integration / PR** — high-level feature narrative with docs reconciled.
 
 ---
 
 ## 2026-10 — Development uses short-lived working branches, master integration, and main milestones
 
+```text
+main    stable milestone/release baseline
+master  integrated accepted development
+feature/fix/refactor/spike branches  active work
+```
+
+Work branches can be iterative/destructive and contain many useful commits. `master` represents accepted integrated work; `main` moves at larger stable/release milestones.
+
+The first meaningful `master -> main` PR should represent the first intentionally structured public release milestone, not merely completion of versioning.
+
+---
+
+## 2026-10 — Working branch scope should remain coherent
+
 ### Decision
 
-PGC uses three conceptual levels of Git history:
+A working branch has one primary intent. Adjacent work stays only when it is directly required to implement, validate, diagnose, or make that intent usable.
 
-```text
-main
-  stable milestone / release baseline
-
-master
-  integrated development state
-
-feature/*, fix/*, refactor/*, spike/*
-  short-lived working branches
-```
+When new work becomes independently reviewable, changes another product area, deserves its own release-note/acceptance story, or begins to dominate the branch diff, create a sibling/follow-on branch instead of silently expanding scope.
 
 ### Rationale
 
-Frequent commits are valuable safety checkpoints during active development, but `master` should represent accepted integrated work and `main` should remain a meaningful stable baseline rather than tracking every implementation churn.
+`feature/host-client-logging` grew to include substantial macOS interaction polish because the logging controls exposed nearby UX issues. The result is accepted and useful, but it demonstrated how easily a feature branch can become a generic improvement bucket.
 
-Short-lived branches let a coherent feature set undergo iterative, destructive, or experimental work without making the integration branches hard to interpret.
+### Implication
 
-Branch names and merge/PR history also provide durable archaeological context for where a feature came from.
+Do not rewrite useful history solely to make old branch boundaries look pure. Apply this guardrail prospectively. A future coherent Client interaction pass would deserve a branch such as `feature/client-ux-improvements`.
 
-### Workflow implications
+---
 
-- branch new feature/fix/refactor/spike work from `master`
-- commit frequently inside the working branch
-- hands-on test and accept the feature set before integration
-- reconcile relevant documentation before merging into `master`
-- merge through a PR or explicit merge when that improves the historical record
-- delete completed working branches after merge so the active branch list stays clean
-- allow `master` to accumulate multiple accepted feature sets before promoting a larger milestone to `main`
-- use a PR for `master` -> `main` milestone promotion so the milestone has a durable high-level summary
+## 2026-10 — Cross-platform features have one driver; other machines validate
 
-### Current milestone intent
+One driver owns feature architecture. Other machines/agents validate natively and fix platform-specific defects without independently redesigning the feature.
 
-The first complete versioning-system pass is a candidate checkpoint for the first substantial `master` -> `main` pull request.
+Manual patch/snapshot handoff is acceptable while remote validation infrastructure does not yet exist. Handoffs include untracked files, baseline, file lists, and validation caveats. Git history, not temporary copies, is authoritative.
 
-### Important non-decision
+Long-term: CI for generic validation plus MCP/self-hosted real-machine validation for platform/hardware paths.
 
-The exact GitHub Release tag scheme, whether Host and Client receive separate release pages, and the exact GitHub Actions trigger/build matrix are not yet locked. Those remain roadmap items until manual releases and the versioning implementation establish the right conventions.
+---
+
+## 2026-10 — Host and Client remain separate applications
+
+Host and Client ship as separate role/platform artifacts. Shared underlying crates are desirable where justified, but no unified Host+Client shell should be introduced merely to combine them.
+
+---
+
+## 2026-10 — First public release includes a deliberate architecture/readiness pass
+
+Before the first meaningful public release, complete a deep analysis-first architecture audit, Host portability baseline, versioning, first-release Client UX, packaging, and hands-on stability validation.
+
+The audit should identify duplication, platform leakage, ownership/coupling, stale code, meaningful performance issues, good shared-crate candidates, and harmful/premature abstractions before refactoring.
+
+---
+
+## 2026-10 — Community and commercial planning remain separate
+
+The community repository is not the commercial/event-product roadmap. Commercial/event planning lives separately and private business/product details do not belong here.
+
+The current GPL license choice is provisional. A source-visible/noncommercial community model such as PolyForm Noncommercial has been discussed as a candidate, but no final license decision has been made. Any future dual-track/commercial licensing and contributor/relicensing strategy requires explicit decisions and professional legal review.

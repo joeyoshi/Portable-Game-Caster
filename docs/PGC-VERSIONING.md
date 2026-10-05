@@ -126,6 +126,30 @@ Platform-only build or packaging changes do not necessarily require a shared pro
 
 Meaningful user-facing fixes to the product contract should normally increment the shared PATCH version.
 
+## Build channel
+
+A build channel is shown beside the product SemVer:
+
+```text
+Development (0.1.0)
+Nightly (0.1.0)
+Beta (0.1.0)
+Release (1.0.0)
+```
+
+Intended meaning:
+
+- `Development`: development/feature builds
+- `Nightly`: future automated/nightly builds
+- `Beta`: integrated/pre-release builds
+- `Release`: formal releases
+
+Build channel is presentation/provenance. It does not replace SemVer, the protocol version, or the platform build number, and it carries no compatibility meaning.
+
+Current state: both apps show `Development (0.1.0)` in the startup header and session log, from an explicit constant in each application.
+
+Branch-to-channel mapping and automatic inference are not decided. Do not implement branch-aware channel inference until the versioning pass.
+
 ## Platform parity
 
 Shared product SemVer implies a shared feature/behavior baseline.
@@ -156,6 +180,8 @@ Map product SemVer and package release/build revision into the appropriate packa
 
 ## Debug / About output
 
+The startup header currently printed by both apps (and written to each session log) already carries version with build channel, platform, protocol, and session ID. It does not yet carry a platform build number.
+
 Recommended Client output:
 
 ```text
@@ -175,6 +201,18 @@ Build 18
 Platform: Windows x64
 Protocol: 1
 ```
+
+## Release artifacts
+
+Host and Client are separate applications and ship as separate downloads per role and platform, for example:
+
+```text
+PGC-Host-Windows-x64
+PGC-Client-Windows-x64
+PGC-Client-macOS-arm64
+```
+
+These names are examples. Artifact names and tag conventions are established by the first manual releases, not locked here.
 
 ## Version independence summary
 
@@ -196,3 +234,5 @@ Protocol 1
 ```
 
 is a perfectly valid PGC release configuration.
+
+Build channel is orthogonal to all four.
