@@ -38,6 +38,11 @@ const PROTOCOL_VERSION: &str = "1";
 // until then every build is a development build.
 const BUILD_CHANNEL: logging::BuildChannel = logging::BuildChannel::Development;
 
+// The Windows Host's own build number: a checkpoint of this executable that
+// only ever goes up, set here by hand. It is independent of the product
+// version (Cargo.toml), the channel, and the protocol version.
+const BUILD_NUMBER: u32 = 1;
+
 
 // MediaMTX logs this when it accepts a publisher on the gameplay path.
 const PUBLISHER_READY_TEXT: &str = "is publishing to path 'gameplay'";
@@ -137,6 +142,7 @@ fn main() -> ExitCode {
         "Portable Game Caster Host",
         BUILD_CHANNEL,
         env!("CARGO_PKG_VERSION"),
+        BUILD_NUMBER,
         PROTOCOL_VERSION,
         logging::SessionNaming::Latest,
     );
