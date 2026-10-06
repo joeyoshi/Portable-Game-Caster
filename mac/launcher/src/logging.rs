@@ -1812,7 +1812,7 @@ mod tests {
     fn client_identity_matches_the_bundle_metadata() {
         assert_eq!(
             version_label(crate::BUILD_CHANNEL, env!("CARGO_PKG_VERSION")),
-            "Development (0.1.1)"
+            "Development (0.1.2)"
         );
         assert_eq!(crate::BUILD_NUMBER, 1);
         assert_eq!(crate::PROTOCOL_VERSION, "1");
