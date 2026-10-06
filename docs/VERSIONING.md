@@ -1,61 +1,71 @@
 # Portable Game Caster Versioning
 
-Portable Game Caster uses independent version concepts for products, protocol compatibility, and platform artifacts. These communicate different things and must not be conflated.
+Portable Game Caster keeps four version/provenance concepts separate:
 
-## Client product version
+1. shared product version
+2. platform/application build number
+3. protocol version
+4. build channel
 
-Client applications use Semantic Versioning across platforms that claim the same feature and behavior baseline.
+These answer different questions and should not be conflated.
+
+## Shared product version
+
+Host and Client share one Portable Game Caster product version representing the same integrated product baseline.
 
 Example:
 
 ```text
-PGC Client 0.7.0
-- macOS
-- Windows
-- Linux
+PGC Host   0.1.1 Build 8
+PGC Client 0.1.1 Build 12
+Protocol   1
 ```
 
-A platform should only claim a shared Client version when it implements that baseline.
+The product version describes the PGC baseline. The independent build numbers identify the concrete Host and Client artifacts.
 
-### Pre-1.0 guidance
+### Pre-1.0 policy
 
-Use:
+PGC uses the SemVer-shaped form:
 
 ```text
 0.MINOR.PATCH
 ```
 
-- MINOR: meaningful feature or behavior baseline change
-- PATCH: compatible bug fixes, polish, or small improvements
+with a deliberate pre-1.0 project policy:
 
-## Host product version
+- MAJOR remains `0` until PGC declares a stable `1.0.0` product contract.
+- MINOR identifies a meaningful development/release generation or milestone.
+- PATCH identifies an accepted integrated product revision.
 
-Host applications use an independent Semantic Version lineage.
+This is intentionally not strict textbook SemVer patch semantics. Before 1.0, PATCH is used as an integrated-development revision number so MINOR remains useful for larger milestones.
+
+## Platform/application build number
+
+Each executable lane carries its own monotonically increasing build number.
+
+Current lanes include:
+
+- Windows Host
+- macOS Client
+
+Build numbers identify accepted executable checkpoints and are independent between lanes.
 
 Example:
 
 ```text
-PGC Host 0.4.2
-PGC Client 0.8.0
+Windows Host 0.1.1 Build 8
+macOS Client 0.1.1 Build 12
 ```
 
-Host and Client versions do not need to match.
+Different build numbers are normal and do not imply a compatibility mismatch.
+
+A documentation-only or planning change does not inherently create a new build.
 
 ## Protocol version
 
-Protocol version is the compatibility contract between Host and Client.
+Protocol version is the Host/Client compatibility contract.
 
-Example:
-
-```text
-Client 0.8.0 supports protocol v1
-Host 0.4.2 supports protocol v1
-=> compatible
-```
-
-Do not infer protocol compatibility from Host or Client SemVer.
-
-## Discovery metadata
+Do not infer compatibility from product version or build number.
 
 Current mDNS TXT contains:
 
@@ -63,7 +73,7 @@ Current mDNS TXT contains:
 version=1
 ```
 
-This represents protocol compatibility, not Host or Client SemVer.
+This currently represents protocol compatibility, not the product version.
 
 If this field is renamed in the future, prefer an explicit compatibility-oriented name such as:
 
@@ -71,26 +81,11 @@ If this field is renamed in the future, prefer an explicit compatibility-oriente
 protocol_version=1
 ```
 
-## Platform build revisions
-
-Each platform artifact may use its own monotonically increasing build number.
-
-Example:
-
-```text
-macOS Client 0.7.2 (build 38)
-Windows Client 0.7.2 (build 22)
-```
-
-Product version communicates the shared feature/behavior baseline. Build number identifies the concrete platform artifact.
-
-Platform-only packaging/build changes do not necessarily require a shared product SemVer bump if product behavior is unchanged. Meaningful user-facing fixes to the product contract should normally increment PATCH.
-
 ## Build channel
 
-Build channel is shown alongside product SemVer and describes provenance, not compatibility.
+Build channel describes provenance/presentation rather than compatibility.
 
-Supported conceptual channels:
+Conceptual channels are:
 
 ```text
 Development
@@ -99,51 +94,70 @@ Beta
 Release
 ```
 
-Build channel does not replace product SemVer, protocol version, or platform build number.
+Current development builds report the `Development` channel explicitly.
 
-## Platform parity
+Build channel does not replace product version, build number, or protocol version.
 
-Shared product SemVer implies a shared feature/behavior baseline.
+## Runtime identity
 
-A platform that has not yet implemented that baseline should not claim the newer shared version merely to keep numbers visually synchronized.
+Runtime diagnostics keep these concepts visibly separate.
 
-This applies independently to Client platforms and Host platforms.
+Current development output follows this shape:
+
+```text
+PORTABLE GAME CASTER HOST
+Version:     Development (0.1.1)
+Build:       1
+Platform:    Windows x86_64
+Logging:     Normal
+Protocol:    1
+```
+
+and:
+
+```text
+PORTABLE GAME CASTER CLIENT
+Version:     Development (0.1.1)
+Build:       1
+Platform:    macOS arm64
+Logging:     Normal
+Protocol:    1
+```
+
+The logging row reflects the active logging mode and may differ between terminal and session-file output.
 
 ## Platform mappings
 
 ### macOS
 
 ```text
-CFBundleShortVersionString = Client or Host SemVer
-CFBundleVersion = platform build number
+CFBundleShortVersionString = shared product version
+CFBundleVersion = macOS Client build number
 ```
+
+The current macOS application bundle uses the same product/build identity shown at runtime.
 
 ### Windows
 
-```text
-Product Version = Client or Host SemVer
-File/build version = platform build number
-```
+The Windows Host exposes product/build identity at runtime.
+
+Native Windows file/version-resource metadata is not yet part of the current implementation and may be added as packaging/release work matures.
 
 ### Linux/package systems
 
-Map product SemVer and package release/build revision into the appropriate package-manager fields.
+Future Linux/package targets should map the same concepts into the appropriate package-manager fields without changing their meaning.
 
-## Runtime/About output
+## Source of truth
 
-Version/provenance output should distinguish at least:
+Product/build identity is explicit and repository-controlled.
 
-```text
-Product version
-Platform build number, when available
-Build channel
-Platform/architecture
-Protocol version
-```
+It is not derived from Git commit count, branch name, or wall-clock timestamp.
+
+CI may later append artifact provenance, but should not replace the durable product/build concepts.
 
 ## Release artifacts
 
-Host and Client are separate applications and ship as separate role/platform artifacts, for example:
+Host and Client remain separate applications and ship as separate role/platform artifacts, for example:
 
 ```text
 PGC-Host-Windows-x64
@@ -151,16 +165,24 @@ PGC-Client-Windows-x64
 PGC-Client-macOS-arm64
 ```
 
-Artifact naming and tag conventions may evolve, but role, platform, product version, and protocol compatibility remain distinct concepts.
+Exact artifact and tag conventions may evolve.
 
 ## Summary
 
-These values may change independently:
-
 ```text
-Client SemVer
-Host SemVer
+Shared product version
+    shared across Host and Client
+    identifies the integrated product baseline
+
+Platform/application build number
+    independent per executable lane
+    identifies the concrete accepted artifact checkpoint
+
 Protocol version
-Platform build number
+    shared compatibility contract
+    changes only when protocol semantics require it
+
 Build channel
+    provenance/presentation metadata
+    no compatibility meaning
 ```
