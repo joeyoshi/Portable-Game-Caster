@@ -6,8 +6,12 @@
 // delivered to the supervisor loop as events. The supervisor decides what each
 // key means, so new keys can be added there without touching this file.
 //
-// Keys are read as console input records without changing the console mode, so
-// Ctrl+C is still handled by the system exactly as before.
+// Keys are read as console input records. Only key presses are acted on; the
+// console handles the mouse itself (selection, copy, wheel scrolling) for as
+// long as QuickEdit is on, so no mouse records arrive here to be swallowed.
+//
+// Ctrl+Q is the quit command. Ctrl+C is not: console.rs makes it an ordinary
+// key while the Host runs, and it is ignored here.
 
 use std::io::{self, IsTerminal};
 use std::path::Path;
@@ -33,6 +37,54 @@ pub fn listen(events: Sender<Event>) -> bool {
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn normalise(key: char) -> char {
     key.to_ascii_lowercase()
+}
+
+
+// What the key reader sends for Ctrl+Q (the character Ctrl+Q types).
+pub const QUIT: char = '\u{11}';
+
+const VK_Q: u16 = 0x51;
+
+const RIGHT_ALT_PRESSED: u32 = 0x0001;
+const LEFT_ALT_PRESSED: u32 = 0x0002;
+const RIGHT_CTRL_PRESSED: u32 = 0x0004;
+const LEFT_CTRL_PRESSED: u32 = 0x0008;
+
+
+// The key a console key record stands for, if the Host acts on it at all:
+// QUIT for Ctrl+Q, the lower-cased character for a plain key, nothing for key
+// releases, modifier and navigation keys, and other control combinations
+// (Ctrl+C among them).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn key_from_record(
+    key_down: bool,
+    virtual_key_code: u16,
+    unicode_char: u16,
+    control_key_state: u32,
+) -> Option<char> {
+    if !key_down {
+        return None;
+    }
+
+    let ctrl =
+        control_key_state & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED) != 0;
+
+    // AltGr is reported as Ctrl+Alt and types a character; it is not Ctrl.
+    let alt =
+        control_key_state & (LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED) != 0;
+
+    if ctrl && !alt {
+        return (virtual_key_code == VK_Q).then_some(QUIT);
+    }
+
+    let key =
+        char::from_u32(u32::from(unicode_char))?;
+
+    if key.is_control() {
+        return None;
+    }
+
+    Some(normalise(key))
 }
 
 
@@ -133,20 +185,20 @@ mod platform {
                     return;
                 }
 
-                if record.event_type != KEY_EVENT || record.key.key_down == 0 {
+                if record.event_type != KEY_EVENT {
                     continue;
                 }
 
-                let Some(key) = char::from_u32(u32::from(record.key.unicode_char)) else {
+                let Some(key) = super::key_from_record(
+                    record.key.key_down != 0,
+                    record.key.virtual_key_code,
+                    record.key.unicode_char,
+                    record.key.control_key_state,
+                ) else {
                     continue;
                 };
 
-                // Modifier and navigation keys carry no character.
-                if key == '\0' {
-                    continue;
-                }
-
-                if events.send(Event::Key(super::normalise(key))).is_err() {
+                if events.send(Event::Key(key)).is_err() {
                     return;
                 }
             }
@@ -181,5 +233,53 @@ mod tests {
     fn keys_are_case_insensitive() {
         assert_eq!(normalise('L'), 'l');
         assert_eq!(normalise('l'), 'l');
+    }
+
+
+    const VK_C: u16 = 0x43;
+    const VK_L: u16 = 0x4C;
+    const VK_CONTROL: u16 = 0x11;
+
+
+    #[test]
+    fn ctrl_q_is_quit() {
+        assert_eq!(key_from_record(true, VK_Q, 0x11, LEFT_CTRL_PRESSED), Some(QUIT));
+        assert_eq!(key_from_record(true, VK_Q, 0x11, RIGHT_CTRL_PRESSED), Some(QUIT));
+
+        // Releasing it is not a second quit.
+        assert_eq!(key_from_record(false, VK_Q, 0x11, LEFT_CTRL_PRESSED), None);
+    }
+
+
+    #[test]
+    fn plain_q_and_altgr_q_are_not_quit() {
+        assert_eq!(key_from_record(true, VK_Q, u16::from(b'q'), 0), Some('q'));
+        assert_eq!(key_from_record(true, VK_Q, u16::from(b'Q'), 0), Some('q'));
+
+        assert_eq!(
+            key_from_record(true, VK_Q, u16::from(b'@'), LEFT_CTRL_PRESSED | RIGHT_ALT_PRESSED),
+            Some('@')
+        );
+    }
+
+
+    #[test]
+    fn ctrl_c_is_not_a_host_command() {
+        // With processed input off, Ctrl+C arrives as this key record.
+        assert_eq!(key_from_record(true, VK_C, 0x03, LEFT_CTRL_PRESSED), None);
+
+        // Even if a console reports it without the modifier state.
+        assert_eq!(key_from_record(true, VK_C, 0x03, 0), None);
+    }
+
+
+    #[test]
+    fn l_opens_logs_and_modifier_keys_are_ignored() {
+        assert_eq!(key_from_record(true, VK_L, u16::from(b'L'), 0), Some('l'));
+        assert_eq!(key_from_record(true, VK_L, u16::from(b'l'), 0), Some('l'));
+        assert_eq!(key_from_record(false, VK_L, u16::from(b'l'), 0), None);
+
+        // Pressing Ctrl on its own.
+        assert_eq!(key_from_record(true, VK_CONTROL, 0, LEFT_CTRL_PRESSED), None);
     }
 }

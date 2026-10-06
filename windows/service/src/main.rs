@@ -113,6 +113,8 @@ fn main() -> ExitCode {
                     "Rejected this startup because another instance owns the machine-wide mutex."
                 ));
 
+                logging::shutdown();
+
                 return ExitCode::SUCCESS;
             }
 
@@ -120,6 +122,8 @@ fn main() -> ExitCode {
                 logging::error("HOST", format_args!(
                     "{error}"
                 ));
+
+                logging::shutdown();
 
                 return ExitCode::FAILURE;
             }
@@ -136,11 +140,11 @@ fn main() -> ExitCode {
 
     // Held until exit, which restores the console's own setting.
     let input_mode_guard =
-        console::disable_quick_edit();
+        console::take_key_commands();
 
     if input_mode_guard.is_some() {
         logging::debug("HOST", format_args!(
-            "Console QuickEdit is off while the Host runs, so clicking the window cannot pause it."
+            "Ctrl+C is an ordinary console key while the Host runs (it copies a selection); Ctrl+Q quits."
         ));
     }
 
@@ -165,6 +169,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let running =
         Arc::new(AtomicBool::new(true));
 
+    // Interrupt signals. In an interactive console Ctrl+C does not raise one
+    // (see console.rs) and Ctrl+Q is the quit command; this still covers
+    // Ctrl+Break, and Ctrl+C when console input is redirected or absent.
     {
         let running =
             Arc::clone(&running);
@@ -274,15 +281,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         logging::info("HOST", format_args!(
             "Press L to open logs folder."
         ));
+
+        logging::info("HOST", format_args!(
+            "Press Ctrl+Q to quit."
+        ));
     } else {
         logging::debug("HOST", format_args!(
             "Console input is not available; hotkeys are disabled."
         ));
-    }
 
-    logging::info("HOST", format_args!(
-        "Press Ctrl+C to stop."
-    ));
+        // No key reader, so the interrupt signal is the way to stop.
+        logging::info("HOST", format_args!(
+            "Press Ctrl+C to stop."
+        ));
+    }
 
 
     // -------------------------------------------------------------------------
@@ -369,6 +381,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
                 Event::Key('l') => {
                     open_logs_folder();
+                }
+
+                Event::Key(hotkeys::QUIT) => {
+                    logging::info("HOST", format_args!(
+                        "Quit requested (Ctrl+Q)."
+                    ));
+
+                    running.store(
+                        false,
+                        Ordering::SeqCst,
+                    );
                 }
 
                 // Other keys are reserved for future console commands.

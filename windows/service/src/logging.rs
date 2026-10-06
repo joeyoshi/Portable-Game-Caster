@@ -9,7 +9,8 @@ use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, LineWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -382,12 +383,134 @@ fn deliver(rendered: Rendered) {
     }
 }
 
-// One write per line, so lines from different threads never interleave.
-fn write_terminal(line: &str) {
-    let mut stderr = io::stderr().lock();
+// -----------------------------------------------------------------------------
+// Terminal sink
+//
+// A console can stop accepting output: while text is selected in a Windows
+// console window, every write to it blocks until the selection is released.
+// Nothing that logs may wait on that, so terminal lines are handed to one
+// writer thread through a bounded queue. When the queue is full, lines are
+// counted and dropped from the terminal (never from the session file), and a
+// single notice says how many once output resumes.
+// -----------------------------------------------------------------------------
 
-    let _ = stderr.write_all(line.as_bytes());
-    let _ = stderr.flush();
+const TERMINAL_QUEUE_LINES: usize = 1024;
+
+// How long exit waits for queued lines to reach a terminal that may be paused.
+const TERMINAL_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
+
+enum TerminalMessage {
+    Line(String),
+
+    // Lines that were dropped while the queue was full.
+    Dropped(usize),
+
+    // Everything queued before this has been written.
+    Flush(mpsc::Sender<()>),
+}
+
+struct TerminalQueue {
+    sender: SyncSender<TerminalMessage>,
+    dropped: AtomicUsize,
+}
+
+impl TerminalQueue {
+    // Never blocks.
+    fn offer(&self, line: &str) {
+        // Report earlier drops ahead of the first line that fits again.
+        let dropped = self.dropped.swap(0, Ordering::Relaxed);
+
+        if dropped > 0
+            && self
+                .sender
+                .try_send(TerminalMessage::Dropped(dropped))
+                .is_err()
+        {
+            self.dropped.fetch_add(dropped + 1, Ordering::Relaxed);
+
+            return;
+        }
+
+        if self
+            .sender
+            .try_send(TerminalMessage::Line(line.to_string()))
+            .is_err()
+        {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+fn dropped_notice(dropped: usize) -> String {
+    format!(
+        "               ... {dropped} line(s) not shown here while console output was paused; the session log has them.\n"
+    )
+}
+
+static TERMINAL: OnceLock<TerminalQueue> = OnceLock::new();
+
+fn terminal_queue() -> &'static TerminalQueue {
+    TERMINAL.get_or_init(|| {
+        let (sender, receiver) = mpsc::sync_channel(TERMINAL_QUEUE_LINES);
+
+        thread::spawn(move || {
+            for message in receiver {
+                let text = match message {
+                    TerminalMessage::Line(line) => line,
+                    TerminalMessage::Dropped(dropped) => dropped_notice(dropped),
+
+                    TerminalMessage::Flush(done) => {
+                        let _ = done.send(());
+
+                        continue;
+                    }
+                };
+
+                // One write per line, so a line is never split.
+                let mut stderr = io::stderr().lock();
+
+                let _ = stderr.write_all(text.as_bytes());
+                let _ = stderr.flush();
+            }
+        });
+
+        TerminalQueue {
+            sender,
+            dropped: AtomicUsize::new(0),
+        }
+    })
+}
+
+fn write_terminal(line: &str) {
+    terminal_queue().offer(line);
+}
+
+// Waits, for a bounded time, until everything logged so far has reached the
+// terminal. Gives up if the terminal is not accepting output.
+fn flush_terminal(timeout: Duration) {
+    let Some(queue) = TERMINAL.get() else {
+        return;
+    };
+
+    let deadline = Instant::now() + timeout;
+    let (done, written) = mpsc::channel();
+    let mut message = TerminalMessage::Flush(done);
+
+    loop {
+        match queue.sender.try_send(message) {
+            Ok(()) => break,
+            Err(TrySendError::Full(returned)) => message = returned,
+            Err(TrySendError::Disconnected(_)) => return,
+        }
+
+        if Instant::now() >= deadline {
+            return;
+        }
+
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let _ = written.recv_timeout(deadline.saturating_duration_since(Instant::now()));
 }
 
 // Line-buffered: each complete line reaches the operating system as it is
@@ -1098,8 +1221,9 @@ fn file_logging_label(file: LogLevel) -> String {
     format!("{file:?} (file)")
 }
 
-// Flushes and closes the session file. Lines logged afterwards go to the
-// terminal only.
+// Flushes and closes the session file, and gives queued terminal lines a
+// bounded time to be written. Lines logged afterwards go to the terminal only.
+// Call before the process exits, or the last terminal lines may be lost.
 pub fn shutdown() {
     FILE_LEVEL.store(LogLevel::Quiet as u8, Ordering::Relaxed);
 
@@ -1108,6 +1232,8 @@ pub fn shutdown() {
             let _ = file.flush();
         }
     }
+
+    flush_terminal(TERMINAL_FLUSH_TIMEOUT);
 }
 
 // -----------------------------------------------------------------------------
@@ -1400,6 +1526,72 @@ mod tests {
         colour: false,
         show_source: true,
     };
+
+    // A terminal queue nobody is draining: a console that is not accepting
+    // output.
+    fn paused_terminal(capacity: usize) -> (TerminalQueue, mpsc::Receiver<TerminalMessage>) {
+        let (sender, receiver) = mpsc::sync_channel(capacity);
+
+        (
+            TerminalQueue {
+                sender,
+                dropped: AtomicUsize::new(0),
+            },
+            receiver,
+        )
+    }
+
+    fn drain(receiver: &mpsc::Receiver<TerminalMessage>) -> Vec<String> {
+        receiver
+            .try_iter()
+            .map(|message| match message {
+                TerminalMessage::Line(line) => line,
+                TerminalMessage::Dropped(dropped) => format!("dropped {dropped}"),
+                TerminalMessage::Flush(_) => "flush".to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn paused_terminal_never_blocks_and_reports_what_it_dropped() {
+        let (queue, receiver) = paused_terminal(2);
+
+        // Returns every time, however many lines are logged while paused.
+        for number in 1..=5 {
+            queue.offer(&format!("line {number}"));
+        }
+
+        assert_eq!(queue.dropped.load(Ordering::Relaxed), 3);
+
+        // Output resumes: what was queued, then the count, then new lines.
+        assert_eq!(drain(&receiver), vec!["line 1", "line 2"]);
+
+        queue.offer("line 6");
+
+        assert_eq!(drain(&receiver), vec!["dropped 3", "line 6"]);
+        assert_eq!(queue.dropped.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn dropped_count_survives_a_queue_that_is_still_full() {
+        let (queue, receiver) = paused_terminal(1);
+
+        queue.offer("line 1");
+        queue.offer("line 2");
+        queue.offer("line 3");
+
+        assert_eq!(queue.dropped.load(Ordering::Relaxed), 2);
+
+        // Room for the notice but not for the line behind it.
+        assert_eq!(drain(&receiver), vec!["line 1"]);
+
+        queue.offer("line 4");
+
+        assert_eq!(drain(&receiver), vec!["dropped 2"]);
+
+        // Line 4 is not lost from the count.
+        assert_eq!(queue.dropped.load(Ordering::Relaxed), 1);
+    }
 
     #[test]
     fn formats_time_of_day() {

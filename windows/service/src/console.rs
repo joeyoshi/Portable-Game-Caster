@@ -10,25 +10,26 @@
 // Colour is only used when both output streams are a console that accepts ANSI
 // escape sequences.
 //
-// QuickEdit is turned off while the Host runs. With it on, a click in the
-// window starts a text selection, and the console then blocks every write to
-// it until the selection is released, which stalls the Host on its next log
-// line and makes a healthy Host look frozen.
+// The console keeps its own mouse behaviour: QuickEdit selection, copy, and
+// wheel scrolling are left exactly as the user has them. A selection makes the
+// console block writes to it; the Host stays unaffected because terminal
+// output goes through a queue that never waits (see logging.rs).
+//
+// The one input flag the Host changes is processed input. With it on, the
+// system turns Ctrl+C into a signal sent to the Host and to the MediaMTX and
+// FFmpeg processes sharing its console. With it off, Ctrl+C is an ordinary key
+// (and still copies a selection, which the console window handles itself), and
+// the Host quits on Ctrl+Q instead (see hotkeys.rs).
 
-const ENABLE_QUICK_EDIT_MODE: u32 =
-    0x0040;
-
-// Required for a change to the QuickEdit flag to be applied.
-const ENABLE_EXTENDED_FLAGS: u32 =
-    0x0080;
+const ENABLE_PROCESSED_INPUT: u32 =
+    0x0001;
 
 
-// The console input mode the Host wants: QuickEdit off, every other flag
-// exactly as found. Processed input (Ctrl+C), mouse and window input are not
-// the Host's to change.
+// The console input mode while the Host takes key commands: processed input
+// off, every other flag (QuickEdit, mouse, window, insert) exactly as found.
 #[cfg_attr(not(windows), allow(dead_code))]
-fn input_mode_without_quick_edit(mode: u32) -> u32 {
-    (mode & !ENABLE_QUICK_EDIT_MODE) | ENABLE_EXTENDED_FLAGS
+fn input_mode_for_key_commands(mode: u32) -> u32 {
+    mode & !ENABLE_PROCESSED_INPUT
 }
 
 
@@ -163,7 +164,7 @@ mod platform {
 
 
     // Puts the console input mode back when the Host exits, so a shell that
-    // launched the Host gets its QuickEdit setting back.
+    // launched the Host gets Ctrl+C back.
     pub struct InputModeGuard {
         handle: Handle,
         original: u32,
@@ -177,9 +178,10 @@ mod platform {
     }
 
 
-    // Returns None when there is nothing to undo: input is not a console,
-    // QuickEdit was already off, or the console refused the change.
-    pub fn disable_quick_edit() -> Option<InputModeGuard> {
+    // Makes Ctrl+C an ordinary key for as long as the guard lives. Returns
+    // None, leaving Ctrl+C as the system's interrupt, when input is not a
+    // console (redirected or absent) or the console refused the change.
+    pub fn take_key_commands() -> Option<InputModeGuard> {
         let handle =
             unsafe { GetStdHandle(STD_INPUT_HANDLE) };
 
@@ -191,12 +193,8 @@ mod platform {
             return None;
         }
 
-        if original & super::ENABLE_QUICK_EDIT_MODE == 0 {
-            return None;
-        }
-
         let wanted =
-            super::input_mode_without_quick_edit(original);
+            super::input_mode_for_key_commands(original);
 
         if unsafe { SetConsoleMode(handle, wanted) } == 0 {
             return None;
@@ -284,30 +282,31 @@ mod platform {
     pub struct InputModeGuard;
 
 
-    // QuickEdit is a Windows console feature.
-    pub fn disable_quick_edit() -> Option<InputModeGuard> {
+    // Key commands are only read from a Windows console.
+    pub fn take_key_commands() -> Option<InputModeGuard> {
         None
     }
 }
 
 
-pub use platform::{disable_quick_edit, enable_ansi, widen};
+pub use platform::{enable_ansi, take_key_commands, widen};
 
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const ENABLE_PROCESSED_INPUT: u32 = 0x0001;
     const ENABLE_LINE_INPUT: u32 = 0x0002;
     const ENABLE_ECHO_INPUT: u32 = 0x0004;
     const ENABLE_WINDOW_INPUT: u32 = 0x0008;
     const ENABLE_MOUSE_INPUT: u32 = 0x0010;
     const ENABLE_INSERT_MODE: u32 = 0x0020;
+    const ENABLE_QUICK_EDIT_MODE: u32 = 0x0040;
+    const ENABLE_EXTENDED_FLAGS: u32 = 0x0080;
 
 
     #[test]
-    fn quick_edit_is_the_only_flag_removed() {
+    fn processed_input_is_the_only_flag_removed() {
         // A classic console's default input mode.
         let default_mode =
             ENABLE_PROCESSED_INPUT
@@ -319,34 +318,32 @@ mod tests {
                 | ENABLE_EXTENDED_FLAGS;
 
         assert_eq!(
-            input_mode_without_quick_edit(default_mode),
-            default_mode & !ENABLE_QUICK_EDIT_MODE
+            input_mode_for_key_commands(default_mode),
+            default_mode & !ENABLE_PROCESSED_INPUT
         );
     }
 
 
     #[test]
-    fn ctrl_c_and_other_input_flags_are_preserved() {
+    fn quick_edit_and_other_input_flags_are_left_as_found() {
         for flag in [
-            ENABLE_PROCESSED_INPUT,
             ENABLE_LINE_INPUT,
             ENABLE_ECHO_INPUT,
             ENABLE_WINDOW_INPUT,
             ENABLE_MOUSE_INPUT,
             ENABLE_INSERT_MODE,
+            ENABLE_QUICK_EDIT_MODE,
+            ENABLE_EXTENDED_FLAGS,
         ] {
-            let mode =
-                input_mode_without_quick_edit(flag | ENABLE_QUICK_EDIT_MODE);
-
-            assert_ne!(mode & flag, 0, "{flag:#06x}");
-            assert_eq!(mode & ENABLE_QUICK_EDIT_MODE, 0);
+            // On stays on, off stays off.
+            assert_eq!(
+                input_mode_for_key_commands(flag | ENABLE_PROCESSED_INPUT),
+                flag,
+                "{flag:#06x}"
+            );
         }
 
-        // Nothing is switched on that was off, apart from the flag that makes
-        // the change take effect.
-        assert_eq!(
-            input_mode_without_quick_edit(ENABLE_QUICK_EDIT_MODE),
-            ENABLE_EXTENDED_FLAGS
-        );
+        assert_eq!(input_mode_for_key_commands(ENABLE_PROCESSED_INPUT), 0);
+        assert_eq!(input_mode_for_key_commands(0), 0);
     }
 }
