@@ -106,7 +106,7 @@ Current development output follows this shape:
 
 ```text
 PORTABLE GAME CASTER HOST
-Version:     Development (0.1.1)
+Version:     Development (0.1.2)
 Build:       1
 Platform:    Windows x86_64
 Logging:     Normal
@@ -117,7 +117,7 @@ and:
 
 ```text
 PORTABLE GAME CASTER CLIENT
-Version:     Development (0.1.1)
+Version:     Development (0.1.2)
 Build:       1
 Platform:    macOS arm64
 Logging:     Normal
