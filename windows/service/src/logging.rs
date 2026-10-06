@@ -750,10 +750,13 @@ fn format_header(colour: bool, application: &str, rows: &[(&str, String)]) -> St
     header
 }
 
-// `version` is the channel and semantic version, e.g. "Development (0.1.0)".
-// `logging` is the level of the sink the header is written to.
+// `version` is the channel and product version, e.g. "Development (0.1.1)".
+// `build` is this application's own build number; it is a separate field, not
+// part of the version. `logging` is the level of the sink the header is written
+// to.
 fn header_rows(
     version: &str,
+    build: u32,
     platform: &str,
     logging: String,
     protocol: &str,
@@ -762,6 +765,7 @@ fn header_rows(
 ) -> Vec<(&'static str, String)> {
     vec![
         ("Version:", version.to_string()),
+        ("Build:", build.to_string()),
         ("Platform:", platform.to_string()),
         ("Logging:", logging),
         ("Protocol:", protocol.to_string()),
@@ -1108,6 +1112,7 @@ pub fn start_session(
     title: &str,
     channel: BuildChannel,
     version: &str,
+    build: u32,
     protocol: &str,
     naming: SessionNaming,
 ) {
@@ -1160,6 +1165,7 @@ pub fn start_session(
             title,
             &header_rows(
                 &version,
+                build,
                 &platform,
                 format!("{:?}", level()),
                 protocol,
@@ -1175,6 +1181,7 @@ pub fn start_session(
             title,
             &header_rows(
                 &version,
+                build,
                 &platform,
                 file_logging_label(file_level()),
                 protocol,
@@ -1846,7 +1853,8 @@ mod tests {
     const PLAIN_HEADER: &str = "\n\
         ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\
         PORTABLE GAME CASTER HOST\n\
-        Version:     Development (0.1.0)\n\
+        Version:     Development (0.1.1)\n\
+        Build:       1\n\
         Platform:    Windows x86_64\n\
         Logging:     Normal\n\
         Protocol:    1\n\
@@ -1860,7 +1868,8 @@ mod tests {
             colour,
             "Portable Game Caster Host",
             &header_rows(
-                &version_label(BuildChannel::Development, "0.1.0"),
+                &version_label(BuildChannel::Development, "0.1.1"),
+                1,
                 "Windows x86_64",
                 "Normal".to_string(),
                 "1",
@@ -1885,8 +1894,8 @@ mod tests {
 
         assert_eq!(lines.first(), Some(&""));
         assert_eq!(lines[1], HEADER_RULE);
-        assert_eq!(lines[9], HEADER_RULE);
-        assert_eq!(&lines[10..], ["", ""]);
+        assert_eq!(lines[10], HEADER_RULE);
+        assert_eq!(&lines[11..], ["", ""]);
         assert_eq!(HEADER_RULE.chars().count(), HEADER_WIDTH);
     }
 
@@ -1900,7 +1909,8 @@ mod tests {
         // bright values, and nothing left switched on.
         assert!(header.contains("\x1b[1;38;5;80mPORTABLE GAME CASTER HOST\x1b[0m"));
         assert!(header.contains(&format!("\x1b[38;5;37m{HEADER_RULE}\x1b[0m")));
-        assert!(header.contains("\x1b[90mVersion:     \x1b[0m\x1b[97mDevelopment (0.1.0)\x1b[0m"));
+        assert!(header.contains("\x1b[90mVersion:     \x1b[0m\x1b[97mDevelopment (0.1.1)\x1b[0m"));
+        assert!(header.contains("\x1b[90mBuild:       \x1b[0m\x1b[97m1\x1b[0m"));
         assert!(header.trim_end().ends_with("\x1b[0m"));
 
         // No background fill.
@@ -1913,6 +1923,7 @@ mod tests {
 
         for label in [
             "Version:",
+            "Build:",
             "Platform:",
             "Logging:",
             "Protocol:",
@@ -1946,9 +1957,47 @@ mod tests {
     }
 
     #[test]
+    fn build_is_its_own_row_directly_under_the_version() {
+        let rows = header_rows(
+            &version_label(BuildChannel::Development, "0.1.1"),
+            1,
+            "Windows x86_64",
+            "Normal".to_string(),
+            "1",
+            "2026-10-05T01:56:37.123Z",
+            None,
+        );
+
+        assert_eq!(rows[0], ("Version:", "Development (0.1.1)".to_string()));
+        assert_eq!(rows[1], ("Build:", "1".to_string()));
+
+        // The build is never folded into the version text, and it is not the
+        // protocol: each keeps its own row and value.
+        let header = format_header(false, "Portable Game Caster Host", &rows);
+
+        assert!(header.contains("Version:     Development (0.1.1)\nBuild:       1\n"));
+        assert!(header.contains("Protocol:    1\n"));
+
+        let other = header_rows(
+            "Release (1.2.0)",
+            47,
+            "Windows x86_64",
+            "Normal".to_string(),
+            "3",
+            "id",
+            None,
+        );
+
+        assert_eq!(other[0].1, "Release (1.2.0)");
+        assert_eq!(other[1], ("Build:", "47".to_string()));
+        assert_eq!(other[4], ("Protocol:", "3".to_string()));
+    }
+
+    #[test]
     fn header_identifies_session_and_missing_log_directory() {
         let rows = header_rows(
             "Development (0.1.0)",
+            1,
             "macOS arm64",
             file_logging_label(LogLevel::Debug),
             "1",
@@ -2024,6 +2073,7 @@ mod tests {
     fn wrapped_header_lines_align_and_match_when_styled() {
         let rows = header_rows(
             "Development (0.1.0)",
+            1,
             "macOS arm64",
             "Debug".to_string(),
             "1",
@@ -2256,6 +2306,7 @@ mod tests {
             "Portable Game Caster Client",
             &header_rows(
                 "Development (0.1.0)",
+                1,
                 "macOS arm64",
                 file_logging_label(LogLevel::Debug),
                 "1",
@@ -2431,7 +2482,8 @@ mod tests {
             false,
             "Portable Game Caster Host",
             &header_rows(
-                "Development (0.1.0)",
+                "Development (0.1.1)",
+                1,
                 "Windows x86_64",
                 file_logging_label(LogLevel::Debug),
                 "1",

@@ -219,6 +219,6 @@ Interactive terminal styling is presentation only. Redirected output and files r
 
 ## Versioning and application structure
 
-Client SemVer, Host SemVer, protocol version, and platform build number are independent concepts. Build channel (`Development`, `Nightly`, `Beta`, `Release`) is provenance/presentation rather than compatibility.
+Host and Client share one product version for the integrated PGC baseline. Each executable lane maintains its own independent build number. Protocol version remains the compatibility contract, while build channel (`Development`, `Nightly`, `Beta`, `Release`) is provenance/presentation rather than compatibility.
 
 Host and Client remain separate applications and release artifacts. Shared crates/core are encouraged where justified; a unified Host+Client shell is not.
