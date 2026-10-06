@@ -173,7 +173,7 @@ fn hold_signal(
 pub fn run_signal() -> Result<(), Box<dyn std::error::Error>> {
     let address =
         env::var(ADDRESS_ENV)
-            .map_err(|_| format!("{ADDRESS_ENV} is not set; the demand signal must be started by the PGC Host's MediaMTX."))?;
+            .map_err(|_| format!("{ADDRESS_ENV} is not set; the demand signal must be started by the Portable Game Caster Host's MediaMTX."))?;
 
     let mut connection =
         TcpStream::connect(address.parse::<SocketAddr>()?)?;

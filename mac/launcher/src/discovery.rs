@@ -77,7 +77,7 @@ pub fn discover_stream(
     logging::debug(
         "DISCOVERY",
         format_args!(
-            "Starting PGC host discovery"
+            "Starting Portable Game Caster host discovery"
         ),
     );
 
@@ -99,7 +99,7 @@ pub fn discover_stream(
             logging::debug(
                 "DISCOVERY",
                 format_args!(
-                    "No PGC host discovered before timeout"
+                    "No Portable Game Caster host discovered before timeout"
                 ),
             );
 
@@ -130,7 +130,7 @@ pub fn discover_host(
     Option<StreamEndpoint>,
     Box<dyn std::error::Error>,
 > {
-    logging::trace(
+    logging::verbose(
         "DISCOVERY",
         format_args!(
             "Searching specifically for host {expected_host}"
@@ -164,7 +164,7 @@ fn discover_matching(
         ServiceDaemon::new()?;
 
 
-    logging::trace(
+    logging::verbose(
         "DISCOVERY",
         format_args!(
             "Starting mDNS browse for {SERVICE_TYPE}"
@@ -258,7 +258,7 @@ fn discover_matching(
                     true;
 
 
-                logging::trace(
+                logging::verbose(
                     "DISCOVERY",
                     format_args!(
                         "mDNS service found: {fullname}"
@@ -287,7 +287,7 @@ fn discover_matching(
                         .to_string();
 
 
-                logging::trace(
+                logging::verbose(
                     "DISCOVERY",
                     format_args!(
                         "Resolved mDNS candidate host: {resolved_host}"
@@ -312,7 +312,7 @@ fn discover_matching(
                             expected
                         )
                     {
-                        logging::trace(
+                        logging::verbose(
                             "DISCOVERY",
                             format_args!(
                                 "Ignoring host {resolved_host}; expected {expected}"
@@ -344,7 +344,7 @@ fn discover_matching(
                         EXPECTED_PROTOCOL
                     )
                 {
-                    logging::trace(
+                    logging::verbose(
                         "DISCOVERY",
                         format_args!(
                             "Ignoring {resolved_host}; unsupported protocol {protocol}"
@@ -388,7 +388,7 @@ fn discover_matching(
                         .iter()
                         .next()
                 else {
-                    logging::trace(
+                    logging::verbose(
                         "DISCOVERY",
                         format_args!(
                             "Host {resolved_host} resolved without IPv4 address; continuing to listen"
@@ -514,7 +514,7 @@ fn discover_matching(
             // -----------------------------------------------------------------
 
             Ok(event) => {
-                logging::trace(
+                logging::verbose(
                     "DISCOVERY",
                     format_args!(
                         "Ignoring mDNS event: {event:?}"
@@ -561,7 +561,7 @@ fn discover_matching(
         logging::debug(
             "DISCOVERY",
             format_args!(
-                "PGC service was seen, but its network address did not resolve before timeout"
+                "Portable Game Caster service was seen, but its network address did not resolve before timeout"
             ),
         );
 
@@ -576,7 +576,7 @@ fn discover_matching(
     if let Some(expected) =
         expected_host
     {
-        logging::trace(
+        logging::verbose(
             "DISCOVERY",
             format_args!(
                 "Host {expected} was not rediscovered before timeout"

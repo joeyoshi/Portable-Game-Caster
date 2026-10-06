@@ -231,7 +231,7 @@ fn probe_until_restored(
                 set_host_missing(false);
 
 
-                logging::trace(
+                logging::verbose(
                     "RECONNECT",
                     format_args!(
                         "Host present at {}; RTSP not ready yet",
@@ -250,7 +250,7 @@ fn probe_until_restored(
                 set_host_missing(true);
 
 
-                logging::trace(
+                logging::verbose(
                     "RECONNECT",
                     format_args!(
                         "Targeted rediscovery failed: {error}"
