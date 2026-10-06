@@ -784,11 +784,12 @@ fn header_rows(
 //   Timestamped   pgc-host-YYYY-MM-DDTHH-MM-SSZ.log
 //                 The file is created with its final name.
 //
-//   Latest        pgc-client-latest.log
+//   Latest        pgc-client-latest.log, pgc-host-latest.log
 //                 The running session always writes here. At the next launch
 //                 the previous file is renamed to its archive name,
 //                 pgc-client-YYYY-MM-DDTHH-MM-SS.sssZ.log, taken from the
-//                 session ID in its own header.
+//                 session ID in its own header. Used by the Client and the
+//                 Host.
 //
 // In both models the UTC start time is the session ID, and only the newest few
 // timestamped files of the application are kept. Rotation only ever touches
@@ -2420,6 +2421,209 @@ mod tests {
                 "pgc-client-latest.log",
             ])
         );
+
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    // What a Host session leaves in its `latest` file.
+    fn write_host_latest(directory: &Path, session_id: &str, body: &str) {
+        let header = format_header(
+            false,
+            "Portable Game Caster Host",
+            &header_rows(
+                "Development (0.1.0)",
+                "Windows x86_64",
+                file_logging_label(LogLevel::Debug),
+                "1",
+                session_id,
+                Some(directory),
+            ),
+        );
+
+        fs::write(
+            directory.join(latest_file_name("host")),
+            format!("{header}{body}"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn host_first_launch_has_nothing_to_archive() {
+        let directory = test_directory("host-first");
+
+        let session = open_session_file(
+            &directory,
+            "host",
+            SessionNaming::Latest,
+            "2026-10-06T01:00:00.111Z",
+        )
+        .unwrap();
+
+        assert_eq!(session.archived, None);
+        assert!(session.archive_error.is_none());
+
+        assert_eq!(listing(&directory), names(&["pgc-host-latest.log"]));
+
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn host_latest_is_archived_under_the_previous_session_id() {
+        let directory = test_directory("host-latest");
+        let naming = SessionNaming::Latest;
+
+        // Logs the Client and the earlier Host naming model left behind.
+        fs::write(directory.join("pgc-client-latest.log"), "client").unwrap();
+        fs::write(directory.join("pgc-host-2026-10-05T23-22-18Z.log"), "older model").unwrap();
+
+        write_host_latest(&directory, "2026-10-06T01:00:00.111Z", "previous session\n");
+
+        // Launched an hour later: the archive carries the previous session's
+        // own start time, not the time of archiving.
+        let session =
+            open_session_file(&directory, "host", naming, "2026-10-06T02:00:00.222Z").unwrap();
+
+        assert_eq!(
+            session.archived.as_deref(),
+            Some("pgc-host-2026-10-06T01-00-00.111Z.log")
+        );
+
+        assert!(session.archive_error.is_none());
+
+        rotate_session_logs(&directory, "host", naming, RETAINED_SESSION_LOGS);
+
+        assert_eq!(
+            listing(&directory),
+            names(&[
+                "pgc-client-latest.log",
+                "pgc-host-2026-10-05T23-22-18Z.log",
+                "pgc-host-2026-10-06T01-00-00.111Z.log",
+                "pgc-host-latest.log",
+            ])
+        );
+
+        assert!(
+            fs::read_to_string(directory.join("pgc-host-2026-10-06T01-00-00.111Z.log"))
+                .unwrap()
+                .ends_with("previous session\n")
+        );
+
+        // The new session starts empty.
+        assert_eq!(
+            fs::read_to_string(directory.join("pgc-host-latest.log")).unwrap(),
+            ""
+        );
+
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn host_keeps_the_newest_five_archives() {
+        let directory = test_directory("host-retention");
+        let naming = SessionNaming::Latest;
+
+        let mut removed = 0;
+
+        for hour in 1..=8 {
+            let id = format!("2026-10-06T{hour:02}:00:00.000Z");
+
+            open_session_file(&directory, "host", naming, &id).unwrap();
+
+            write_host_latest(&directory, &id, "session\n");
+
+            removed += rotate_session_logs(&directory, "host", naming, RETAINED_SESSION_LOGS);
+        }
+
+        // Seven sessions archived so far, two of them rotated out.
+        assert_eq!(removed, 2);
+
+        assert_eq!(
+            listing(&directory),
+            names(&[
+                "pgc-host-2026-10-06T03-00-00.000Z.log",
+                "pgc-host-2026-10-06T04-00-00.000Z.log",
+                "pgc-host-2026-10-06T05-00-00.000Z.log",
+                "pgc-host-2026-10-06T06-00-00.000Z.log",
+                "pgc-host-2026-10-06T07-00-00.000Z.log",
+                "pgc-host-latest.log",
+            ])
+        );
+
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn host_latest_that_is_not_text_is_archived_intact() {
+        let directory = test_directory("host-malformed");
+
+        let garbage: Vec<u8> = vec![0xFF, 0xFE, 0x00, 0x9F, b'\n', 0xC3, 0x28];
+
+        fs::write(directory.join("pgc-host-latest.log"), &garbage).unwrap();
+
+        let session = open_session_file(
+            &directory,
+            "host",
+            SessionNaming::Latest,
+            "2026-10-06T02:00:00.222Z",
+        )
+        .unwrap();
+
+        // No session ID to read, so the name comes from the file's own
+        // modification time; the content is kept byte for byte.
+        let archived = session.archived.unwrap();
+
+        assert!(is_session_log("host", SessionNaming::Latest, &archived));
+        assert_eq!(fs::read(directory.join(&archived)).unwrap(), garbage);
+
+        assert_eq!(
+            fs::read(directory.join("pgc-host-latest.log")).unwrap(),
+            Vec::<u8>::new()
+        );
+
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    // Another program holding the file open without allowing it to be renamed.
+    #[cfg(windows)]
+    #[test]
+    fn host_latest_that_cannot_be_renamed_is_appended_to_not_destroyed() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_SHARE_READ: u32 = 0x1;
+        const FILE_SHARE_WRITE: u32 = 0x2;
+
+        let directory = test_directory("host-locked");
+
+        write_host_latest(&directory, "2026-10-06T01:00:00.111Z", "previous session\n");
+
+        let holder = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(directory.join("pgc-host-latest.log"))
+            .unwrap();
+
+        let mut session = open_session_file(
+            &directory,
+            "host",
+            SessionNaming::Latest,
+            "2026-10-06T02:00:00.222Z",
+        )
+        .unwrap();
+
+        assert_eq!(session.archived, None);
+        assert!(session.archive_error.is_some());
+
+        session.file.write_all(b"next session\n").unwrap();
+
+        drop(session);
+        drop(holder);
+
+        assert_eq!(listing(&directory), names(&["pgc-host-latest.log"]));
+
+        let text = fs::read_to_string(directory.join("pgc-host-latest.log")).unwrap();
+
+        assert!(text.contains("previous session\n"));
+        assert!(text.ends_with("next session\n"));
 
         fs::remove_dir_all(&directory).unwrap();
     }

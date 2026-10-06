@@ -135,7 +135,7 @@ fn main() -> ExitCode {
         BUILD_CHANNEL,
         env!("CARGO_PKG_VERSION"),
         PROTOCOL_VERSION,
-        logging::SessionNaming::Timestamped,
+        logging::SessionNaming::Latest,
     );
 
     // Held until exit, which restores the console's own setting.
