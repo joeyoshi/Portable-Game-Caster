@@ -629,9 +629,11 @@ fn format_header(colour: bool, application: &str, rows: &[(&str, String)]) -> St
 }
 
 // `version` is the channel and semantic version, e.g. "Development (0.1.0)".
+// `build` is this executable's own build number, separate from the version.
 // `logging` is the level of the sink the header is written to.
 fn header_rows(
     version: &str,
+    build: u32,
     platform: &str,
     logging: String,
     protocol: &str,
@@ -640,6 +642,7 @@ fn header_rows(
 ) -> Vec<(&'static str, String)> {
     vec![
         ("Version:", version.to_string()),
+        ("Build:", build.to_string()),
         ("Platform:", platform.to_string()),
         ("Logging:", logging),
         ("Protocol:", protocol.to_string()),
@@ -985,6 +988,7 @@ pub fn start_session(
     title: &str,
     channel: BuildChannel,
     version: &str,
+    build: u32,
     protocol: &str,
     naming: SessionNaming,
 ) {
@@ -1037,6 +1041,7 @@ pub fn start_session(
             title,
             &header_rows(
                 &version,
+                build,
                 &platform,
                 format!("{:?}", level()),
                 protocol,
@@ -1052,6 +1057,7 @@ pub fn start_session(
             title,
             &header_rows(
                 &version,
+                build,
                 &platform,
                 file_logging_label(file_level()),
                 protocol,
@@ -1270,6 +1276,7 @@ pub fn init_from_args() {
         "Portable Game Caster Client",
         crate::BUILD_CHANNEL,
         env!("CARGO_PKG_VERSION"),
+        crate::BUILD_NUMBER,
         crate::PROTOCOL_VERSION,
         SessionNaming::Latest,
     );
@@ -1675,7 +1682,8 @@ mod tests {
     const PLAIN_HEADER: &str = "\n\
         ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\
         PORTABLE GAME CASTER HOST\n\
-        Version:     Development (0.1.0)\n\
+        Version:     Development (0.1.1)\n\
+        Build:       1\n\
         Platform:    Windows x86_64\n\
         Logging:     Normal\n\
         Protocol:    1\n\
@@ -1689,7 +1697,8 @@ mod tests {
             colour,
             "Portable Game Caster Host",
             &header_rows(
-                &version_label(BuildChannel::Development, "0.1.0"),
+                &version_label(BuildChannel::Development, "0.1.1"),
+                1,
                 "Windows x86_64",
                 "Normal".to_string(),
                 "1",
@@ -1714,8 +1723,8 @@ mod tests {
 
         assert_eq!(lines.first(), Some(&""));
         assert_eq!(lines[1], HEADER_RULE);
-        assert_eq!(lines[9], HEADER_RULE);
-        assert_eq!(&lines[10..], ["", ""]);
+        assert_eq!(lines[10], HEADER_RULE);
+        assert_eq!(&lines[11..], ["", ""]);
         assert_eq!(HEADER_RULE.chars().count(), HEADER_WIDTH);
     }
 
@@ -1729,7 +1738,7 @@ mod tests {
         // bright values, and nothing left switched on.
         assert!(header.contains("\x1b[1;38;5;80mPORTABLE GAME CASTER HOST\x1b[0m"));
         assert!(header.contains(&format!("\x1b[38;5;37m{HEADER_RULE}\x1b[0m")));
-        assert!(header.contains("\x1b[90mVersion:     \x1b[0m\x1b[97mDevelopment (0.1.0)\x1b[0m"));
+        assert!(header.contains("\x1b[90mVersion:     \x1b[0m\x1b[97mDevelopment (0.1.1)\x1b[0m"));
         assert!(header.trim_end().ends_with("\x1b[0m"));
 
         // No background fill.
@@ -1742,6 +1751,7 @@ mod tests {
 
         for label in [
             "Version:",
+            "Build:",
             "Platform:",
             "Logging:",
             "Protocol:",
@@ -1775,9 +1785,63 @@ mod tests {
     }
 
     #[test]
+    fn build_number_is_its_own_row_after_the_version() {
+        let rows = header_rows(
+            "Development (0.1.1)",
+            7,
+            "macOS arm64",
+            "Debug".to_string(),
+            "1",
+            "2026-10-05T01:56:37.123Z",
+            None,
+        );
+
+        let header = format_header(false, "Portable Game Caster Client", &rows);
+
+        assert!(header.contains("Version:     Development (0.1.1)\nBuild:       7\nPlatform:"));
+        assert!(header.contains("Protocol:    1\n"));
+
+        let styled = format_header(true, "Portable Game Caster Client", &rows);
+
+        assert!(styled.contains("\x1b[90mBuild:       \x1b[0m\x1b[97m7\x1b[0m"));
+        assert_eq!(strip_ansi(&styled), header);
+    }
+
+    // The identity this Client reports, and the bundle metadata that must agree.
+    #[test]
+    fn client_identity_matches_the_bundle_metadata() {
+        assert_eq!(
+            version_label(crate::BUILD_CHANNEL, env!("CARGO_PKG_VERSION")),
+            "Development (0.1.1)"
+        );
+        assert_eq!(crate::BUILD_NUMBER, 1);
+        assert_eq!(crate::PROTOCOL_VERSION, "1");
+
+        let plist = include_str!("../../app/Info.plist");
+
+        let value_of = |key: &str| {
+            plist
+                .split_once(&format!("<key>{key}</key>"))
+                .and_then(|(_, rest)| rest.split_once("<string>"))
+                .and_then(|(_, rest)| rest.split_once("</string>"))
+                .map(|(value, _)| value.to_string())
+        };
+
+        assert_eq!(
+            value_of("CFBundleShortVersionString").as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(
+            value_of("CFBundleVersion"),
+            Some(crate::BUILD_NUMBER.to_string())
+        );
+    }
+
+    #[test]
     fn header_identifies_session_and_missing_log_directory() {
         let rows = header_rows(
             "Development (0.1.0)",
+            1,
             "macOS arm64",
             file_logging_label(LogLevel::Debug),
             "1",
@@ -1853,6 +1917,7 @@ mod tests {
     fn wrapped_header_lines_align_and_match_when_styled() {
         let rows = header_rows(
             "Development (0.1.0)",
+            1,
             "macOS arm64",
             "Debug".to_string(),
             "1",
@@ -2085,6 +2150,7 @@ mod tests {
             "Portable Game Caster Client",
             &header_rows(
                 "Development (0.1.0)",
+                1,
                 "macOS arm64",
                 file_logging_label(LogLevel::Debug),
                 "1",
