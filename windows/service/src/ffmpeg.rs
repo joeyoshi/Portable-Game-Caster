@@ -23,6 +23,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::encoder_output::{PublisherWait, RecentOutput, MAX_DETAIL_LINES};
+use crate::console;
 use crate::job::ChildJob;
 use crate::logging;
 
@@ -440,13 +441,21 @@ impl Encoder {
             self.executable.display()
         ));
 
+        let mut command =
+            Command::new(&self.executable);
+
+        command
+            .args(capture_arguments())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+
+        // Only the Host stops FFmpeg; it must not also be interrupted by the
+        // console.
+        console::detach_from_console(&mut command);
+
         let spawned =
-            Command::new(&self.executable)
-                .args(capture_arguments())
-                .stdin(Stdio::piped())
-                .stdout(Stdio::null())
-                .stderr(Stdio::piped())
-                .spawn();
+            command.spawn();
 
         let mut child =
             match spawned {

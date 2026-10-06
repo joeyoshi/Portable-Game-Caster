@@ -17,7 +17,7 @@ use std::process::{Child, Command, ExitCode, Stdio};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc::{self, RecvTimeoutError, Sender},
-    Arc,
+    Arc, Mutex,
 };
 use std::thread;
 use std::time::Duration;
@@ -66,6 +66,9 @@ pub enum Event {
 
     // A key pressed in the interactive Host console (lower-cased).
     Key(char),
+
+    // The console asked the Host to stop (window closed, interrupt key, ...).
+    Control(console::ControlEvent),
 }
 
 
@@ -169,18 +172,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let running =
         Arc::new(AtomicBool::new(true));
 
-    // Interrupt signals. In an interactive console Ctrl+C does not raise one
-    // (see console.rs) and Ctrl+Q is the quit command; this still covers
-    // Ctrl+Break, and Ctrl+C when console input is redirected or absent.
-    {
-        let running =
-            Arc::clone(&running);
+    let (events_tx, events_rx) =
+        mpsc::channel::<Event>();
 
-        ctrlc::set_handler(move || {
-            running.store(
-                false,
-                Ordering::SeqCst,
-            );
+    // Console control events: the window being closed, logoff, shutdown, and
+    // interrupt keys. In an interactive console Ctrl+C does not raise one (see
+    // console.rs) and Ctrl+Q is the quit command; Ctrl+Break still does, and
+    // so does Ctrl+C when console input is redirected or absent. The handler
+    // only reports the event; the supervisor loop performs the shutdown.
+    {
+        let events =
+            Mutex::new(events_tx.clone());
+
+        console::on_control_event(move |event| {
+            if let Ok(events) = events.lock() {
+                let _ = events.send(Event::Control(event));
+            }
         })?;
     }
 
@@ -214,9 +221,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // -------------------------------------------------------------------------
     // Demand signal + child containment
     // -------------------------------------------------------------------------
-
-    let (events_tx, events_rx) =
-        mpsc::channel::<Event>();
 
     let demand_listener =
         demand::listen(
@@ -396,10 +400,31 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
                 // Other keys are reserved for future console commands.
                 Event::Key(_) => {}
+
+                Event::Control(event) => {
+                    logging::info("HOST", format_args!(
+                        "Quit requested ({}).",
+                        event.description()
+                    ));
+
+                    running.store(
+                        false,
+                        Ordering::SeqCst,
+                    );
+                }
+            }
+
+            // Once a quit is requested, nothing after it is acted on.
+            if !running.load(Ordering::SeqCst) {
+                break;
             }
 
             next_event =
                 events_rx.try_recv().ok();
+        }
+
+        if !running.load(Ordering::SeqCst) {
+            break;
         }
 
 
@@ -680,23 +705,31 @@ fn start_mediamtx(
     //
     // The environment tells MediaMTX's runOnDemand command (this executable in
     // demand-signal mode) where to find the Host.
+    let mut command =
+        Command::new(executable);
+
+    command
+        .current_dir(
+            working_directory
+        )
+        .env(
+            demand::ADDRESS_ENV,
+            demand_address.to_string(),
+        )
+        .env(
+            demand::HOST_EXECUTABLE_ENV,
+            env::current_exe()?,
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    // Only the Host stops MediaMTX; it must not also be interrupted by the
+    // console.
+    console::detach_from_console(&mut command);
+
     let mut child =
-        Command::new(executable)
-            .current_dir(
-                working_directory
-            )
-            .env(
-                demand::ADDRESS_ENV,
-                demand_address.to_string(),
-            )
-            .env(
-                demand::HOST_EXECUTABLE_ENV,
-                env::current_exe()?,
-            )
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+        command.spawn()?;
 
 
     job.assign(&child, "MediaMTX");
