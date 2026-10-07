@@ -90,6 +90,22 @@ Implementation reports should include:
 
 Update public documentation when implementation changes user-visible behavior, architecture contracts, build requirements, protocol behavior, or contributor-facing invariants.
 
+## Recoverability and documentation discipline
+
+Assume any coordinator or coding-agent session may end without warning.
+
+Material implementation facts should not remain only in chat once later work depends on them. Update the appropriate repository documentation promptly when a ticket establishes or changes a durable contributor-facing invariant.
+
+For executable work tickets:
+
+- predefine the candidate next build number for each affected application lane;
+- keep that candidate number through revision rounds;
+- treat it as canonical only after accepted work is integrated into the owning `feature/*`;
+- normally allow only one unresolved candidate build per executable lane at a time;
+- retire accepted `work/*` branches after integration and verification.
+
+Chat context is not project memory. Git history and current repository documentation are.
+
 ## Product invariants
 
 1. UI states describe observable reality, not implementation state.
