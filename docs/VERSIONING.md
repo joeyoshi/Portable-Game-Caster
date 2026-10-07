@@ -59,6 +59,10 @@ macOS Client 0.1.1 Build 12
 
 Different build numbers are normal and do not imply a compatibility mismatch.
 
+Executable development normally uses an ephemeral `work/*` ticket branch created from the owning `feature/*` branch. The ticket predefines the candidate next build number for each affected executable lane. Implementation and revision rounds keep that same candidate number. It becomes canonical only when the accepted ticket is integrated into the feature branch.
+
+By default, only one unresolved candidate build should exist per executable lane at a time. Same-lane executable tickets are therefore serialized unless the project deliberately records a different unique reservation scheme. Different application lanes may still proceed independently.
+
 A documentation-only or planning change does not inherently create a new build.
 
 ## Protocol version
