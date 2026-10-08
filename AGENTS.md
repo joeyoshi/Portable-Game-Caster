@@ -162,3 +162,7 @@ capture device
 ```
 
 PowerShell/PID-file FFmpeg ownership is legacy/deprecated and must not be reintroduced without an explicit architecture decision.
+
+## Documentation placement across the PGC family
+
+For any new feature idea or cross-product documentation, begin with the [PGC project bootstrap](https://github.com/BoonSquare/pgc-lab/blob/main/PROJECT-BOOTSTRAP.md) and the private [documentation ownership protocol](https://github.com/BoonSquare/pgc-lab/blob/main/process/DOCUMENTATION-OWNERSHIP.md) when authorized. Inspect existing topical files before creating new ones. This public repository owns **current Community implementation and contributor-facing contracts**, not speculative Venue strategy or private infrastructure. Prefer extending the exact existing documentation owner, and use brief links instead of duplicating broader private planning. Contributors without private-repository access should follow this local ownership boundary and flag cross-repository placement questions rather than guessing.
